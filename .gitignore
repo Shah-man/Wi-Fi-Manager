@@ -1,0 +1,22 @@
+# Пользовательские данные и результаты тестов (создаются при работе)
+# User data and test results (created at runtime)
+wifi-unlock/
+wifi-tools/
+*.pcapng
+*.pcap
+*.cap
+*.22000
+*.hccapx
+cracked.txt
+rockyou.txt
+*.log
+
+# Ключи и секреты / Keys and secrets
+.wpasec_key
+*.key
+
+# Системное / System
+*.swp
+*.tmp
+*~
+.DS_Store

@@ -103,7 +103,7 @@ wh                # launch the manager
 wifistart         # enable monitor mode
 wifistop          # disable monitor mode
 sudo installwh    # update / rebuild everything
-sudo uninstallwh  # remove completely (your data folder is kept)
+uninstallwh       # remove completely (your data folder is kept)
 ```
 
 Navigation: **↑ ↓** to select, **Enter** to open, **Esc** to go back. During a capture, press **any key** to stop.
